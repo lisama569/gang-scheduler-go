@@ -1,0 +1,145 @@
+# Gang 集群作业调度器（单进程模拟）
+
+在单个 Go 进程内用**模拟节点 + 逻辑时钟心跳**驱动多个作业并发执行，
+演示 gang（整作业）调度、优先级队列、节点故障回收、以及进程重启后的状态恢复。
+设计目标是：**在不同调度顺序下，资源分配、故障恢复与作业状态保持一致且可解释**。
+
+## 1. 目录结构
+
+| 路径 | 职责 |
+| --- | --- |
+| `pkg/api` | 核心领域类型（Resource/Node/Task/Job）、资源运算、可区分错误 |
+| `pkg/cluster` | 模拟节点与节点池：容量账本、心跳、超时检测、gang 放置的“全有或全无”提交 |
+| `pkg/execution` | 模拟执行器：按 tick 推进任务、故障终止、故障注入，通过事件通道上报 |
+| `pkg/state` | 作业状态存储：内存表 + JSON 快照原子落盘（临时文件 rename）+ 合并恢复 |
+| `pkg/scheduler` | 调度器：提交校验、队列调度、心跳回收、事件聚合、恢复 |
+| `cmd/gangscheduler` | 可本地运行的端到端演示 |
+
+## 2. 模型与概念
+
+- **Resource**：`{CPU, Memory}` 标量资源；`Fits / Add / Sub` 运算见 `pkg/api/resource.go`。
+- **逻辑时钟（tick）**：`Scheduler.Tick()` 推进一个时钟周期。
+  既可用事件方式逐 tick 调用（测试，确定可断言），也可用 `Run(stop)` 按 10ms 自动推进。
+- **任务时长 Duration**：任务启动后需推进的 tick 数；启动发生在 tick 内的调度阶段，
+  tick 末尾执行器统一推进一拍。
+- **节点**：有 `Capacity` 与 `Used` 账本，以及 `Healthy/Dead` 状态和最近心跳时间戳。
+- **作业状态**：`Pending → Running → Succeeded/Failed`；
+  **任务状态**：`Pending → Running → Succeeded/Failed`。
+
+## 3. 调度规则
+
+### 3.1 提交校验（三类可区分拒绝原因）
+
+`Submit` 返回的错误可用标准库 `errors.Is` 判定：
+
+| 哨兵错误 | 触发条件 |
+| --- | --- |
+| `api.ErrInvalidRequest` | 作业 ID 为空、无任务、任务名为空/重复、资源为负、`Duration<=0` |
+| `api.ErrInsufficientResources` | 作业在**当前集群拓扑下永远放不下**：存在任务超过最大单节点容量，或全部任务资源之和超过健康节点容量之和 |
+| `api.ErrDuplicateJob` | 作业 ID 已存在——**包括已结束作业**，结束作业不会复活 |
+
+- “当前资源被占用导致这一轮放不下”属于**暂时不足**，作业会进入队列等待，不会被拒绝。
+- 拒绝时日志打印具体 `reason`（哪个任务、多少资源、对比容量），失败原因可区分、可解释。
+
+### 3.2 Gang（整作业）放置
+
+- 一个作业的**全部 `Pending` 任务必须作为整体获得资源后才一起启动**：
+  `Pool.Plan` 先做纯计算的放置方案，任一任务放不下则整体返回 `nil`，账本零改动；
+  `Pool.TryCommit` 再做原子提交，任一节点占用失败则整体不生效。
+- **确定性**：节点按 ID 排序、任务按提交顺序处理，先在暂记账本上模拟、通过后才落账，
+  因此无论调度遍历顺序如何，放置结果都一致。
+- **优先级队列**：每个 tick 按 `Priority` 降序、同优先级按作业 ID 升序尝试；
+  队头作业这一轮放不下时**不阻塞**后续作业（non head-of-line blocking）。
+- 故障后作业可能同时含 `Running` 与 `Pending` 任务：只要存在 `Pending` 任务，
+  该作业就继续参与 gang 放置（剩余任务不会被饿死）。
+
+### 3.3 作业终态与任务结果一致
+
+- 全部任务 `Succeeded` → 作业 `Succeeded`；任一任务 `Failed`（故障注入）→ 作业 `Failed`，
+  `JobRuntime.Reason` 记录 `task failed: <name>`。
+- 完成/终止事件处理是**幂等**的：只对“当前确为 Running 且位于该节点”的任务生效，
+  迟到/重复事件被忽略并打印日志，已完成任务不会重复执行或重复计入。
+
+## 4. 心跳与节点故障回收
+
+1. 每个 tick，仍存活（未被故障注入摘除）的健康节点刷新心跳时间戳。
+2. `TriggerNodeFailure(nodeID)` 模拟节点故障：停止为该节点刷新心跳。
+3. 统一的超时检测路径：当 `now - lastBeat > HeartbeatTimeoutTicks` 时：
+   - 节点标记 `Dead`，其占用账本清零并记录 `Released`（日志可解释）；
+   - `Executor.KillOnNode` 终止该节点上的在执行行任务，释放资源、发 `EvKilled` 事件；
+   - 调度器把这些**当时确在该节点运行**的任务复位为 `Pending`、`Attempt+1`、清空 NodeID，
+     随后由正常 gang 调度重新放置到其他健康节点。
+4. **已完成任务不受影响**：死亡节点上已 `Succeeded/Failed` 的任务保留结果，不重跑、不重计。
+   迟到心跳也不会让已判死节点复活。
+5. 资源账本不变量：健康节点 `Used` 之和 == 执行器在执行行请求之和；终态后全部归零，
+   不允许超发（`Used > Capacity`）或负数占用。
+
+## 5. 进程重启恢复
+
+- 每次作业状态变更（接纳、启动、完成、失败、复位）都立即用
+  **临时文件 + 原子 rename** 写一张完整 JSON 快照，并将版本号 `Counter` +1。
+- 进程重启后构造新的调度器并重新注册节点（节点池与执行行从空白开始），
+  调用 `Scheduler.Recover()`：
+  - **已结束作业**（Succeeded/Failed）原样保留，不参与调度，重新提交时返回 `ErrDuplicateJob`，
+    **不会复活**；
+  - **未完成作业**继续调度；崩溃前处于 `Running` 的任务因执行行已不存在，
+    统一复位为 `Pending`、清空 NodeID、`Attempt+1`，随下一次 tick 重新 gang 放置；
+  - 新节点池账本初始为零，因此**不会重复占用**崩溃前的资源。
+- **并发安全**：所有作业状态访问都由调度器的单把 `s.mu` 串行化；
+  `state.Store` 不再自持锁，保证“查重 + 写入”“恢复合并”等复合操作原子。
+  `Recover` 采用**合并而非整表覆盖**：内存中已存在的更新事实保留，
+  仅并入快照中缺失的作业，版本号取较大值，避免恢复把并发提交冲掉。
+  **重启契约：`Recover()` 在调度循环启动前执行一次**，之后 Tick 才开始，
+  从而杜绝恢复与调度同时进行时的重复占用与作业丢失。
+
+## 6. 可观测性
+
+- 调度器通过 `log/slog` 输出关键决策：作业接纳/三类拒绝原因、gang 放置明细
+  （任务→节点及资源量）、延迟放置原因、心跳超时与回收资源量、任务被杀与重调度、
+  作业终态。测试通过 `t.Log` 桥接，`go test -v` 可直接看到这些依据。
+
+## 7. 验证方法
+
+```bash
+# 构建与静态检查
+go build ./...
+go vet ./...
+
+# 全部单测（-v 可看到关键调度决策日志）
+go test ./... -v
+
+# 竞态检测
+go test ./... -race
+
+# 高重复次数验证调度结果确定性 / 无偶发
+go test ./pkg/scheduler/ -count=200
+
+# 端到端演示：提交→三类拒绝→故障重调度→重启恢复
+go run ./cmd/gangscheduler
+```
+
+### 测试覆盖
+
+| 场景 | 测试 |
+| --- | --- |
+| 非法 / 重复 / 资源不足三类拒绝原因可区分 | `TestSubmitInvalid` `TestSubmitInsufficient` `TestSubmitDuplicate` |
+| 暂时不足排队、释放后按优先级调度 | `TestQueueAndPriority` |
+| gang 全有或全无、放置确定性、原子提交 | `pkg/cluster`：`TestPoolPlanAllOrNothing` 等 |
+| 运行中节点故障→任务复位→换节点重调度 | `TestNodeFailureReschedule` |
+| 已完成任务在节点死后不重跑、不重计 | `TestCompletedTaskNotRerun` |
+| 任务失败→作业 Failed 且原因可区分、失败幂等 | `TestTaskFailureFailsJob` |
+| 全流程资源账本不变量（占用==在执行行、终态归零） | `TestResourceAccountingInvariant` |
+| 并发重复提交恰好一个成功 | `TestConcurrentSubmitSameID` |
+| 调度与提交并发下资源/状态不变量 | `TestConcurrentTicksAndSubmit`（-race） |
+| 终态作业恢复不复活、重复提交仍拒绝 | `TestRecoverTerminalNotResurrected` |
+| 崩溃时运行中任务恢复后继续并完成、不重复占用 | `TestRecoverRunningTasksResumed` |
+| 运行期快照可跨实例继续、版本号单调 | `TestRecoverPersistRoundTrip` |
+| 恢复后并发提交+调度不丢作业、不泄漏资源 | `TestRecoverConcurrentWithTicks` |
+| 存储深拷贝隔离、持久化往返 | `pkg/state` 全部测试 |
+
+## 8. 已知边界与取舍
+
+- 容量可行性是基于**提交时刻的静态集群拓扑**判断；若之后故障导致集群容量永久缩减，
+  一个原本可行的作业可能长期停留 `Pending`（不会错误地成功或超发）。
+- 模拟执行不区分抢占：已运行任务不会被高优先级作业抢占，只在节点故障后重调度。
+- 快照为全量 JSON、每次变更同步落盘，面向“可解释、易验证”的教学/演示用途，非高吞吐生产实现。
