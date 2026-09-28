@@ -8,8 +8,9 @@ type Resource struct {
 
 // 节点状态。
 const (
-	NodeHealthy = "Healthy"
-	NodeDead    = "Dead"
+	NodeHealthy  = "Healthy"
+	NodeDraining = "Draining" // 计划内维护：不再接收新任务，存量任务迁移中
+	NodeDead     = "Dead"
 )
 
 // 任务状态。
@@ -67,6 +68,14 @@ type NodeRuntime struct {
 	LastBeat int64 // 最近一次心跳的逻辑时钟
 }
 
+// DrainInfo 描述一个节点维护/排空的进展（供观测与测试断言）。
+type DrainInfo struct {
+	NodeID             string
+	State              string   // 节点当前状态（Draining/Dead/...）
+	RemainingTasks     int      // 仍跑在该节点上、尚未迁走的任务数
+	RemainingResources Resource // 这些任务仍占用的资源量
+}
+
 // jobRecord / taskRecord 是持久化到状态存储的快照记录。
 type TaskRecord struct {
 	Spec    TaskSpec
@@ -86,4 +95,7 @@ type JobRecord struct {
 type Snapshot struct {
 	Counter int
 	Jobs    []JobRecord
+	// Draining 记录处于维护/排空中的节点 ID，保证重启恢复后
+	// 这些节点不会被当成正常机器重新投入调度。
+	Draining []string
 }

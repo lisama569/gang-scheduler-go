@@ -76,7 +76,8 @@ func (p *Pool) BeatAll(now int64, alive map[string]bool) {
 	}
 }
 
-// DetectDead 找出心跳超时的健康节点，标记死亡并回收其账本上的全部占用。
+// DetectDead 找出心跳超时的存活节点（健康或排空中），标记死亡并回收其账本上的全部占用。
+// 排空中的节点若同时发生故障，也走同一条回收路径，其未迁完任务按故障语义复位。
 func (p *Pool) DetectDead(now, timeoutTicks int64) []DeadNode {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -84,13 +85,57 @@ func (p *Pool) DetectDead(now, timeoutTicks int64) []DeadNode {
 	for _, id := range p.order {
 		n := p.nodes[id]
 		snap := n.Snapshot()
-		if n.isHealthy() && now-snap.LastBeat > timeoutTicks {
+		if n.isAlive() && now-snap.LastBeat > timeoutTicks {
 			released := snap.Used
 			n.MarkDead()
 			dead = append(dead, DeadNode{ID: id, Released: released})
 		}
 	}
 	return dead
+}
+
+// BeginDrain 把一个健康节点置为维护/排空中。
+// 节点不存在返回 ErrNodeNotFound；节点不是健康态返回 ErrNodeNotHealthy。
+func (p *Pool) BeginDrain(id string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n, ok := p.nodes[id]
+	if !ok {
+		return api.ErrNodeNotFound
+	}
+	if !n.BeginDrain() {
+		return api.ErrNodeNotHealthy
+	}
+	return nil
+}
+
+// CompleteDrain 在节点排空完成后将其退役（置 Dead，容量永久扣除）。
+// 节点不存在/不在排空态/仍有占用分别返回可区分错误。
+func (p *Pool) CompleteDrain(id string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n, ok := p.nodes[id]
+	if !ok {
+		return api.ErrNodeNotFound
+	}
+	if n.Snapshot().State != api.NodeDraining {
+		return api.ErrNodeNotDraining
+	}
+	if !n.Retire() {
+		return api.ErrNodeNotEmpty
+	}
+	return nil
+}
+
+// DrainUsed 返回节点当前账本占用（排空中即“还剩多少资源没迁走”）。
+func (p *Pool) DrainUsed(id string) (api.Resource, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n, ok := p.nodes[id]
+	if !ok {
+		return api.Resource{}, api.ErrNodeNotFound
+	}
+	return n.Snapshot().Used, nil
 }
 
 // sortedHealthyIDs 返回健康节点 ID 的确定性排序（注册顺序即确定，这里再防御性排序）。

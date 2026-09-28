@@ -63,6 +63,40 @@ func main() {
 	printJob(s1, "job-app")
 	printNodes(s1)
 
+	// ---------- 计划内维护：排空并下线 node-c ----------
+	fmt.Println("==== phase 1.5: planned maintenance: drain and retire node-c ====")
+	// 扩容一台 node-c，再把 w2 调度上去，随后对它做计划内排空。
+	must(s1.AddNode("node-c", api.Resource{CPU: 4, Memory: 8}))
+	must(s1.Submit(api.JobSpec{ID: "job-web", Priority: 5,
+		Tasks: []api.TaskSpec{
+			{Name: "w1", Resources: api.Resource{CPU: 3, Memory: 4}, Duration: 4},
+			{Name: "w2", Resources: api.Resource{CPU: 2, Memory: 2}, Duration: 3},
+		}}))
+	s1.Tick() // w1->node-a, w2->node-c
+
+	// 主动把健康的 node-c 置为维护/排空中：不再收新任务，存量任务安全迁出。
+	must(s1.DrainNode("node-c"))
+	printDrain(s1, "node-c") // 还剩 1 个任务没迁完
+	s1.Tick()                // w2 被驱逐；node-a 余量不足，w2 排队等待
+	printDrain(s1, "node-c") // 节点已空
+	// 任务全部迁走后正式退役，容量从集群中扣除。
+	must(s1.CompleteNodeDrain("node-c"))
+	printNodes(s1)
+
+	// 收缩后的集群（只剩 node-a={4,8}）放不下总量 {5,4} 的作业，会被明确拒绝；
+	// 而排空前 node-a+node-c={8,16} 是可以放下的。
+	err = s1.Submit(api.JobSpec{ID: "job-after-shrink", Priority: 1,
+		Tasks: []api.TaskSpec{
+			{Name: "x", Resources: api.Resource{CPU: 3, Memory: 2}, Duration: 1},
+			{Name: "y", Resources: api.Resource{CPU: 2, Memory: 2}, Duration: 1},
+		}})
+	fmt.Printf("submit after capacity shrink rejected as: %v\n", err)
+
+	for i := 0; i < 10; i++ {
+		s1.Tick() // w1 完成后 w2 在 node-a 上继续，job-web 最终成功
+	}
+	printJob(s1, "job-web")
+
 	// ---------- 第二次“进程”启动：从快照恢复 ----------
 	fmt.Println("==== phase 2: simulated process restart, recover from snapshot ====")
 	s2 := scheduler.New(scheduler.Config{
@@ -71,7 +105,7 @@ func main() {
 		Logger:                logger,
 	})
 	must(s2.AddNode("node-a", api.Resource{CPU: 4, Memory: 8}))
-	must(s2.AddNode("node-b", api.Resource{CPU: 2, Memory: 4}))
+	must(s2.AddNode("node-c", api.Resource{CPU: 4, Memory: 8}))
 	ver, err := s2.Recover()
 	must(err)
 	fmt.Printf("recovered snapshot version=%d\n", ver)
@@ -119,4 +153,15 @@ func printNodes(s *scheduler.Scheduler) {
 		fmt.Printf("node %s state=%s used={cpu:%d mem:%d} cap={cpu:%d mem:%d}\n",
 			n.ID, n.State, n.Used.CPU, n.Used.Memory, n.Capacity.CPU, n.Capacity.Memory)
 	}
+}
+
+func printDrain(s *scheduler.Scheduler, id string) {
+	info, err := s.DrainStatus(id)
+	if err != nil {
+		fmt.Println(id, "drain status err:", err)
+		return
+	}
+	fmt.Printf("drain %s state=%s remainingTasks=%d remaining={cpu:%d mem:%d}\n",
+		info.NodeID, info.State, info.RemainingTasks,
+		info.RemainingResources.CPU, info.RemainingResources.Memory)
 }

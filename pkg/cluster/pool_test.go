@@ -95,3 +95,88 @@ func TestPoolHeartbeatTimeout(t *testing.T) {
 		t.Fatal("late heartbeat must not resurrect a dead node")
 	}
 }
+
+// TestPoolDrainExcludesPlacement 排空中节点不参与 Plan/TryCommit，
+// 但心跳与超时检测仍把它当存活节点；退役后容量彻底消失。
+func TestPoolDrainExcludesPlacement(t *testing.T) {
+	p := NewPool()
+	_ = p.AddNode("n1", api.Resource{CPU: 2, Memory: 2})
+	_ = p.AddNode("n2", api.Resource{CPU: 2, Memory: 2})
+
+	if err := p.BeginDrain("n2"); err != nil {
+		t.Fatalf("begin drain: %v", err)
+	}
+	// 排空中节点不再接收新任务：两个任务只能挤 n1，整体放不下 -> nil。
+	plan := p.Plan(
+		map[string]api.Resource{"a": {CPU: 2, Memory: 2}, "b": {CPU: 2, Memory: 2}},
+		[]string{"a", "b"},
+	)
+	if plan != nil {
+		t.Fatalf("draining node must be excluded from plan: %+v", plan)
+	}
+	// 单任务可放 n1；提交后 n2 仍空。
+	plan = p.Plan(map[string]api.Resource{"a": {CPU: 2, Memory: 2}}, []string{"a"})
+	if len(plan) != 1 || plan[0].NodeID != "n1" {
+		t.Fatalf("task must go to healthy n1: %+v", plan)
+	}
+	if !p.TryCommit(plan) {
+		t.Fatal("commit to n1 should succeed")
+	}
+
+	// 排空中节点仍算存活：心跳刷新、不会被超时判死。
+	p.BeatAll(10, map[string]bool{"n1": true, "n2": true})
+	if dead := p.DetectDead(11, 2); len(dead) != 0 {
+		t.Fatalf("draining node with fresh heartbeat must not be reclaimed: %+v", dead)
+	}
+	// 但排空中的节点若停止心跳（维护中发生故障），同样被超时回收。
+	if dead := p.DetectDead(20, 2); len(dead) != 2 {
+		t.Fatalf("stale draining node must be reclaimed like healthy ones: %+v", dead)
+	}
+}
+
+// TestPoolCompleteDrain 退役语义：未排空/有占用/状态非法时返回可区分错误。
+func TestPoolCompleteDrain(t *testing.T) {
+	p := NewPool()
+	_ = p.AddNode("n1", api.Resource{CPU: 2, Memory: 2})
+
+	if err := p.BeginDrain("ghost"); err != api.ErrNodeNotFound {
+		t.Fatalf("drain unknown node: %v", err)
+	}
+	if err := p.CompleteDrain("n1"); err != api.ErrNodeNotDraining {
+		t.Fatalf("complete on healthy node: %v", err)
+	}
+	if err := p.BeginDrain("n1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.BeginDrain("n1"); err != api.ErrNodeNotHealthy {
+		t.Fatalf("double drain: %v", err)
+	}
+	// 排空中的节点被故障回收后不能再“完成退役”。
+	p.BeatAll(1, map[string]bool{"n1": true})
+	p.DetectDead(10, 2) // n1 超时判死
+	if err := p.CompleteDrain("n1"); err != api.ErrNodeNotDraining {
+		t.Fatalf("complete on dead node: %v", err)
+	}
+}
+
+// TestPoolCompleteDrainEmpty 空节点排空后可正常退役，状态转为 Dead。
+func TestPoolCompleteDrainEmpty(t *testing.T) {
+	p := NewPool()
+	_ = p.AddNode("n1", api.Resource{CPU: 2, Memory: 2})
+	if err := p.BeginDrain("n1"); err != nil {
+		t.Fatal(err)
+	}
+	used, err := p.DrainUsed("n1")
+	if err != nil || used != (api.Resource{}) {
+		t.Fatalf("empty node used: %+v err=%v", used, err)
+	}
+	if err := p.CompleteDrain("n1"); err != nil {
+		t.Fatalf("complete empty drain: %v", err)
+	}
+	if got := p.Snapshot()[0].State; got != api.NodeDead {
+		t.Fatalf("retired node state=%s want Dead", got)
+	}
+	if _, err := p.DrainUsed("ghost"); err != api.ErrNodeNotFound {
+		t.Fatalf("drain used on unknown node: %v", err)
+	}
+}

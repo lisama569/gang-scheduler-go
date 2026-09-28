@@ -20,10 +20,13 @@ type Store struct {
 	path    string
 	counter int // 已持久化版本号，每次写盘 +1
 	jobs    map[string]*api.JobRuntime
+	// draining 记录处于维护/排空中的节点 ID，随快照一起落盘，
+	// 保证重启恢复后排空中的节点不会被当成健康机器重新投入调度。
+	draining map[string]bool
 }
 
 func New(path string) *Store {
-	return &Store{path: path, jobs: map[string]*api.JobRuntime{}}
+	return &Store{path: path, jobs: map[string]*api.JobRuntime{}, draining: map[string]bool{}}
 }
 
 func cloneTask(t api.TaskRuntime) api.TaskRuntime {
@@ -102,13 +105,37 @@ func (s *Store) List() []*api.JobRuntime {
 
 func (s *Store) Counter() int { return s.counter }
 
+// SetDraining 记录/清除一个节点的排空标记并立即落盘。
+// 调用方必须持有上层串行化锁。
+func (s *Store) SetDraining(nodeID string, on bool) error {
+	if on {
+		s.draining[nodeID] = true
+	} else {
+		delete(s.draining, nodeID)
+	}
+	return s.Persist()
+}
+
+// IsDraining 查询节点是否被标记为排空中。
+func (s *Store) IsDraining(nodeID string) bool { return s.draining[nodeID] }
+
+// Draining 返回全部排空中节点 ID 的确定性排序列表。
+func (s *Store) Draining() []string {
+	out := make([]string, 0, len(s.draining))
+	for id := range s.draining {
+		out = append(out, id)
+	}
+	sortStrings(out)
+	return out
+}
+
 // Persist 将当前内存状态原子写盘：先写临时文件再 rename，并推进版本号。
 func (s *Store) Persist() error {
 	if s.path == "" {
 		s.counter++
 		return nil
 	}
-	snap := api.Snapshot{Counter: s.counter + 1}
+	snap := api.Snapshot{Counter: s.counter + 1, Draining: s.Draining()}
 	ids := make([]string, 0, len(s.jobs))
 	for id := range s.jobs {
 		ids = append(ids, id)
@@ -186,6 +213,11 @@ func (s *Store) Recover() (int, []*api.JobRuntime, error) {
 	}
 	if snap.Counter > s.counter {
 		s.counter = snap.Counter
+	}
+	// 排空标记按并集合并：磁盘快照中的维护中节点不因重启而丢失，
+	// 内存中已有的标记（恢复与并发排空交错时更新）也不被旧快照回退。
+	for _, id := range snap.Draining {
+		s.draining[id] = true
 	}
 	return snap.Counter, added, nil
 }

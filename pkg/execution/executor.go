@@ -13,6 +13,7 @@ type EventKind int
 const (
 	EvFinished EventKind = iota // 正常执行到节拍结束（含故障注入导致的失败）
 	EvKilled                    // 节点故障被强制终止
+	EvDrained                   // 节点计划内维护/排空被安全驱逐
 )
 
 // Event 是 executor 发往调度器的任务事件。
@@ -87,6 +88,33 @@ func (e *Executor) KillOnNode(nodeID string) {
 		e.pool.Release(nodeID, inf.request)
 		e.events <- Event{
 			Kind:     EvKilled,
+			JobID:    inf.jobID,
+			TaskName: inf.taskName,
+			NodeID:   nodeID,
+			Request:  inf.request,
+		}
+	}
+}
+
+// EvictOnNode 为计划内维护驱逐某节点上的全部在执行行：释放节点账本资源并
+// 投递 EvDrained，由调度器将这些任务复位为 Pending 并迁移到其它健康节点。
+// 与 KillOnNode（故障）的区别仅在事件语义与日志可解释性；已完成任务不在
+// 执行行中，不受影响，不会被重复执行或重复统计。
+func (e *Executor) EvictOnNode(nodeID string) {
+	e.mu.Lock()
+	var evicted []*inflight
+	for key, inf := range e.running {
+		if inf.nodeID == nodeID {
+			evicted = append(evicted, inf)
+			delete(e.running, key)
+		}
+	}
+	e.mu.Unlock()
+
+	for _, inf := range evicted {
+		e.pool.Release(nodeID, inf.request)
+		e.events <- Event{
+			Kind:     EvDrained,
 			JobID:    inf.jobID,
 			TaskName: inf.taskName,
 			NodeID:   nodeID,

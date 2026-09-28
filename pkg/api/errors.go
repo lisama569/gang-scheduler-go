@@ -12,6 +12,16 @@ var (
 	ErrInsufficientResources = errors.New("insufficient resources: job can never fit the cluster")
 	// ErrJobNotFound 查询/等待的作业不存在。
 	ErrJobNotFound = errors.New("job not found")
+
+	// 节点维护/排空相关的可区分错误。
+	// ErrNodeNotFound 操作的节点未注册。
+	ErrNodeNotFound = errors.New("node not found")
+	// ErrNodeNotHealthy 排空目标节点不是健康状态（已排空中或已死亡）。
+	ErrNodeNotHealthy = errors.New("node is not healthy")
+	// ErrNodeNotDraining 完成退役的目标节点不在排空状态。
+	ErrNodeNotDraining = errors.New("node is not draining")
+	// ErrNodeNotEmpty 节点上仍有未迁走的任务，不能退役。
+	ErrNodeNotEmpty = errors.New("node still has running tasks")
 )
 
 // RejectError 包装拒绝原因，便于调用方 errors.Is 判断并打印明细。
