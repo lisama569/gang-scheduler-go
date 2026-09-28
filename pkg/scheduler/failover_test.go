@@ -151,9 +151,12 @@ func assertLedger(t *testing.T, s *Scheduler) {
 		if n.Used.CPU > n.Capacity.CPU || n.Used.Memory > n.Capacity.Memory {
 			t.Fatalf("overcommit on %s: used=%+v cap=%+v", n.ID, n.Used, n.Capacity)
 		}
-		if n.State == api.NodeHealthy {
+		// 健康与排空中节点都可能承载在执行行任务；死亡/退役节点账本必须为零。
+		if n.State == api.NodeHealthy || n.State == api.NodeDraining {
 			usedCPU += n.Used.CPU
 			usedMem += n.Used.Memory
+		} else if n.Used.CPU != 0 || n.Used.Memory != 0 {
+			t.Fatalf("%s node %s must have zero ledger, got %+v", n.State, n.ID, n.Used)
 		}
 	}
 	// executor 在执行行的请求总和必须与健康节点账本一致。

@@ -76,7 +76,8 @@ func (p *Pool) BeatAll(now int64, alive map[string]bool) {
 	}
 }
 
-// DetectDead 找出心跳超时的健康节点，标记死亡并回收其账本上的全部占用。
+// DetectDead 找出心跳超时的健康/排空中节点，标记死亡并回收其账本上的全部占用。
+// 已退役节点无心跳也不会被判死（它是计划内下线，不是故障）。
 func (p *Pool) DetectDead(now, timeoutTicks int64) []DeadNode {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -84,13 +85,123 @@ func (p *Pool) DetectDead(now, timeoutTicks int64) []DeadNode {
 	for _, id := range p.order {
 		n := p.nodes[id]
 		snap := n.Snapshot()
-		if n.isHealthy() && now-snap.LastBeat > timeoutTicks {
+		if (n.isHealthy() || n.isDraining()) && now-snap.LastBeat > timeoutTicks {
 			released := snap.Used
 			n.MarkDead()
 			dead = append(dead, DeadNode{ID: id, Released: released})
 		}
 	}
 	return dead
+}
+
+// CordonNode 请求对一个健康节点做计划内维护/排空：
+// 状态 Healthy -> Draining，从此不再接收新任务。
+// 节点不存在或非健康（已排空/死亡/退役）时返回错误。
+func (p *Pool) CordonNode(nodeID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n, ok := p.nodes[nodeID]
+	if !ok {
+		return fmt.Errorf("node %s not registered", nodeID)
+	}
+	if !n.Cordon() {
+		return fmt.Errorf("node %s is %s, only healthy nodes can be drained", nodeID, n.Snapshot().State)
+	}
+	return nil
+}
+
+// MigrateOne 把一份正在 from 节点执行的占用 r 原子迁移到 to 节点：
+// 先在 to 上占用成功才从 from 归还；目标占用失败则双方账本不变并返回 false。
+// 目标必须仍是健康节点（可能在计算放置与提交之间被排空）；
+// 源节点必须仍是排空中的同一节点（防止并发状态变化下对错账动手）。
+// 这保证迁移“要么完成、要么没发生”，不会重复占用也不会让资源凭空消失。
+func (p *Pool) MigrateOne(from, to string, r api.Resource) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	src, ok := p.nodes[from]
+	if !ok || !src.isDraining() {
+		return false
+	}
+	dst, ok := p.nodes[to]
+	if !ok || !dst.isHealthy() || !r.Fits(dst.Available()) {
+		return false
+	}
+	if !dst.allocate(r) {
+		return false
+	}
+	if !src.release(r) {
+		// 理论不可达：调用方按在执行行记账；回滚目标占用保护账本。
+		dst.release(r)
+		return false
+	}
+	return true
+}
+
+// UndoMigrate 是迁移失败后的内部回滚：把先前成功的目标占用还原回源节点。
+func (p *Pool) UndoMigrate(from, to string, r api.Resource) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	dst := p.nodes[to]
+	src := p.nodes[from]
+	if dst == nil || src == nil {
+		return false
+	}
+	if !dst.release(r) {
+		return false
+	}
+	if !src.allocateRaw(r) {
+		// 理论不可达：源账本此前确有该占用。
+		dst.allocateRaw(r)
+		return false
+	}
+	return true
+}
+
+// RetireIfEmpty 把账本已清空的排空节点正式退役（Draining -> Retired）。
+// 节点不存在、不是排空中或仍有占用时返回 false，账本不变。
+func (p *Pool) RetireIfEmpty(nodeID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n, ok := p.nodes[nodeID]
+	if !ok || !n.isDraining() {
+		return false
+	}
+	snap := n.Snapshot()
+	if snap.Used != (api.Resource{}) {
+		return false
+	}
+	return n.Retire()
+}
+
+// DrainingIDs 返回当前处于排空中的节点 ID（按注册顺序）。
+func (p *Pool) DrainingIDs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var ids []string
+	for _, id := range p.order {
+		if p.nodes[id].isDraining() {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// RestoreNodeState 在重启恢复时按快照重放节点生命周期状态。
+// 节点必须已重新注册；返回错误表示快照中的节点拓扑在本进程缺失。
+func (p *Pool) RestoreNodeState(id, state string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n, ok := p.nodes[id]
+	if !ok {
+		return fmt.Errorf("snapshot references unregistered node %s", id)
+	}
+	switch state {
+	case api.NodeHealthy, api.NodeDraining, api.NodeDead, api.NodeRetired:
+		n.restoreState(state)
+		return nil
+	default:
+		return fmt.Errorf("unknown node state %q for node %s", state, id)
+	}
 }
 
 // sortedHealthyIDs 返回健康节点 ID 的确定性排序（注册顺序即确定，这里再防御性排序）。
@@ -136,6 +247,23 @@ func (p *Pool) Plan(taskReqs map[string]api.Resource, taskOrder []string) []Plac
 		}
 	}
 	return placements
+}
+
+// PlanTarget 为单个任务在健康节点中找一个能放下的目标节点（按 ID 确定性选取）。
+// 不做任何账本变更；放不下返回空串。排空中/退役/死亡节点不会成为目标。
+func (p *Pool) PlanTarget(req api.Resource, exclude string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, id := range p.sortedHealthyIDsLocked() {
+		if id == exclude {
+			continue
+		}
+		n := p.nodes[id]
+		if req.Fits(n.Available()) {
+			return id
+		}
+	}
+	return ""
 }
 
 // TryCommit 原子提交一批放置：任一节点占用失败则整体不生效。

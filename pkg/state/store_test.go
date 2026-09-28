@@ -67,12 +67,15 @@ func TestStorePersistRecoverRoundTrip(t *testing.T) {
 	}
 
 	s2 := New(path)
-	gotVer, jobs, err := s2.Recover()
+	gotVer, jobs, nodes, err := s2.Recover()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if gotVer != ver || len(jobs) != 2 {
 		t.Fatalf("recover ver=%d jobs=%d want ver=%d count=2", gotVer, len(jobs), ver)
+	}
+	if nodes != nil {
+		t.Fatalf("snapshot without topology provider must have no nodes, got %d", len(nodes))
 	}
 	byID := map[string]*api.JobRuntime{}
 	for _, j := range jobs {
@@ -88,9 +91,9 @@ func TestStorePersistRecoverRoundTrip(t *testing.T) {
 
 func TestStoreRecoverMissingFile(t *testing.T) {
 	s := New(filepath.Join(t.TempDir(), "absent.json"))
-	ver, jobs, err := s.Recover()
-	if err != nil || ver != 0 || jobs != nil {
-		t.Fatalf("missing file must mean empty state: ver=%d jobs=%v err=%v", ver, jobs, err)
+	ver, jobs, nodes, err := s.Recover()
+	if err != nil || ver != 0 || jobs != nil || nodes != nil {
+		t.Fatalf("missing file must mean empty state: ver=%d jobs=%v nodes=%v err=%v", ver, jobs, nodes, err)
 	}
 }
 

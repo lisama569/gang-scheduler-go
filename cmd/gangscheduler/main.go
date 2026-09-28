@@ -92,7 +92,59 @@ func main() {
 	}
 	printJob(s2, "job-after-restart")
 	printNodes(s2)
+
+	// ---------- 第三次“进程”启动：演示计划内维护/排空 ----------
+	fmt.Println("==== phase 3: planned maintenance / node drain ====")
+	s3 := scheduler.New(scheduler.Config{
+		HeartbeatTimeoutTicks: 2,
+		StateFile:             filepath.Join(stateDir, "snapshot3.json"),
+		Logger:                logger,
+	})
+	must(s3.AddNode("node-a", api.Resource{CPU: 4, Memory: 8}))
+	must(s3.AddNode("node-b", api.Resource{CPU: 2, Memory: 4}))
+	must(s3.AddNode("node-c", api.Resource{CPU: 4, Memory: 8}))
+	if _, err := s3.Recover(); err != nil {
+		must(err)
+	}
+
+	must(s3.Submit(api.JobSpec{ID: "job-maint", Priority: 5,
+		Tasks: []api.TaskSpec{
+			{Name: "a", Resources: api.Resource{CPU: 3, Memory: 4}, Duration: 5},
+			{Name: "b", Resources: api.Resource{CPU: 2, Memory: 3}, Duration: 5},
+		}}))
+	s3.Tick() // a -> node-a, b -> node-b
+	printJob(s3, "job-maint")
+
+	// 在任务运行中主动把 node-b 置为维护/排空。
+	must(s3.DrainNode("node-b"))
+	printDrain(s3)
+	s3.Tick() // b 在线迁移到 node-c，node-b 迁空后退役
+	fmt.Println("-- after one drain tick --")
+	printJob(s3, "job-maint")
+	printDrain(s3)
+	printNodes(s3)
+
+	// 容量已收缩为 node-a(4)+node-c(4)=8cpu：9cpu 新作业按收缩后容量被拒。
+	err = s3.Submit(api.JobSpec{ID: "job-too-big-after-shrink", Priority: 1,
+		Tasks: []api.TaskSpec{
+			{Name: "x", Resources: api.Resource{CPU: 3, Memory: 1}, Duration: 1},
+			{Name: "y", Resources: api.Resource{CPU: 3, Memory: 1}, Duration: 1},
+			{Name: "z", Resources: api.Resource{CPU: 3, Memory: 1}, Duration: 1},
+		}})
+	fmt.Printf("submit after shrink rejected as: %v\n", err)
+
+	for i := 0; i < 6; i++ {
+		s3.Tick()
+	}
+	printJob(s3, "job-maint")
+	printNodes(s3)
 	fmt.Println("demo finished")
+}
+
+func printDrain(s *scheduler.Scheduler) {
+	for _, p := range s.DrainProgress() {
+		fmt.Printf("drain node %s state=%s remainingTasks=%d\n", p.NodeID, p.State, p.Remaining)
+	}
 }
 
 func must(err error) {

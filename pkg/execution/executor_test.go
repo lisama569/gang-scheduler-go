@@ -114,3 +114,56 @@ func TestInjectFailure(t *testing.T) {
 		t.Fatal("second injection after finish must be rejected (idempotent)")
 	}
 }
+
+// TestMigrateKeepsRemainingTicks 计划内维护的在线迁移只改在执行行归属，
+// 保留剩余节拍；迁到错误源节点或不存在任务时失败。
+func TestMigrateKeepsRemainingTicks(t *testing.T) {
+	e, pool, events := newExec(t)
+	if err := pool.AddNode("n2", api.Resource{CPU: 4, Memory: 4}); err != nil {
+		t.Fatal(err)
+	}
+	// a 跑在 n1（占用 1cpu）。
+	if !pool.TryCommit([]cluster.Placement{
+		{TaskName: "a", NodeID: "n1", Request: api.Resource{CPU: 1, Memory: 1}},
+	}) {
+		t.Fatal("commit")
+	}
+	_ = e.Launch("j", rt("a", 3, 1))
+
+	// 源节点不符时迁移失败。
+	if e.Migrate("j", "a", "n2", "n1") {
+		t.Fatal("migrate from a node that does not host the task must fail")
+	}
+	// n1 进入计划内排空；账本层先迁移（n1 -> n2），再让执行行改挂。
+	if err := pool.CordonNode("n1"); err != nil {
+		t.Fatal(err)
+	}
+	if !pool.MigrateOne("n1", "n2", api.Resource{CPU: 1, Memory: 1}) {
+		t.Fatal("ledger migration should succeed")
+	}
+	if !e.Migrate("j", "a", "n1", "n2") {
+		t.Fatal("live migrate should succeed")
+	}
+
+	// 再推进 3 拍：迁移保留剩余节拍，任务应在第 3 拍于 n2 上正常结束。
+	for i := 0; i < 2; i++ {
+		e.Tick()
+		select {
+		case ev := <-events:
+			t.Fatalf("task must not finish before its remaining ticks, got %+v", ev)
+		default:
+		}
+	}
+	e.Tick()
+	ev := <-events
+	if ev.Kind != EvFinished || ev.NodeID != "n2" || !ev.OK {
+		t.Fatalf("task should finish on n2 after preserved ticks: %+v", ev)
+	}
+	// 完成后资源在 n2 上释放，n1 始终为空。
+	if n, _ := pool.Node("n1"); n.Snapshot().Used.CPU != 0 {
+		t.Fatalf("n1 should be empty, used=%d", n.Snapshot().Used.CPU)
+	}
+	if n, _ := pool.Node("n2"); n.Snapshot().Used.CPU != 0 {
+		t.Fatalf("n2 should release after finish, used=%d", n.Snapshot().Used.CPU)
+	}
+}

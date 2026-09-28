@@ -55,6 +55,16 @@ func New(cfg Config) *Scheduler {
 	events := make(chan execution.Event, 1024)
 	pool := cluster.NewPool()
 	store := state.New(cfg.StateFile)
+	// 每次落盘时从节点池取全量拓扑（含 Draining/Retired 生命周期），
+	// 节点状态因此随快照持久化，重启后可重放，维护中的节点不会被当成健康机器。
+	store.SetTopologyProvider(func() []api.NodeRecord {
+		nodes := pool.Snapshot()
+		recs := make([]api.NodeRecord, 0, len(nodes))
+		for _, n := range nodes {
+			recs = append(recs, api.NodeRecord{ID: n.ID, Capacity: n.Capacity, State: n.State})
+		}
+		return recs
+	})
 	s := &Scheduler{
 		pool:    pool,
 		store:   store,
@@ -211,6 +221,55 @@ func (s *Scheduler) TriggerNodeFailure(nodeID string) {
 	s.log.Warn("node failure injected, heartbeat stopped", "node", nodeID, "clock", s.clock)
 }
 
+// DrainNode 发起计划内维护/下线：把一个健康节点置为 Draining。
+// 从这一刻起它不再接收新任务（gang 放置与提交容量判断都只认健康节点），
+// 其上在执行行任务随后由 Tick 安全地在线迁移到其他健康节点；
+// 全部迁走后节点自动转为 Retired，容量从可用容量中扣除。
+// 节点不存在或当前非健康（已排空中/死亡/退役）返回错误。
+func (s *Scheduler) DrainNode(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.pool.CordonNode(nodeID); err != nil {
+		s.log.Warn("drain request rejected", "node", nodeID, "err", err.Error())
+		return err
+	}
+	// 节点状态立即落盘：即使立刻崩溃，重启后也仍是排空中，不会被当健康机器用。
+	if err := s.store.Persist(); err != nil {
+		return fmt.Errorf("persist drain state: %w", err)
+	}
+	s.log.Warn("node drain initiated, no new tasks will be placed on it",
+		"node", nodeID, "clock", s.clock)
+	return nil
+}
+
+// DrainProgress 返回所有“计划内维护”节点（排空中 + 已退役）的排空进展，
+// 按节点 ID 排序。Remaining 为尚未迁走的在执行行任务数；退役节点必为 0。
+func (s *Scheduler) DrainProgress() []api.DrainProgress {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	remaining := map[string]int{}
+	for _, j := range s.store.List() {
+		for _, t := range j.Tasks {
+			if t.State == api.TaskRunning {
+				remaining[t.NodeID]++
+			}
+		}
+	}
+	var out []api.DrainProgress
+	for _, n := range s.pool.Snapshot() {
+		if n.State == api.NodeDraining || n.State == api.NodeRetired {
+			out = append(out, api.DrainProgress{
+				NodeID:    n.ID,
+				State:     n.State,
+				Remaining: remaining[n.ID],
+			})
+		}
+	}
+	sort.Slice(out, func(i, k int) bool { return out[i].NodeID < out[k].NodeID })
+	return out
+}
+
 // Nodes 返回全部节点的资源/状态快照（供观测与测试断言）。
 func (s *Scheduler) Nodes() []api.NodeRuntime {
 	return s.pool.Snapshot()
@@ -276,10 +335,13 @@ func (s *Scheduler) Tick() {
 		s.drainEventsLocked()      // 同步完成任务复位，保证本 tick 状态可断言
 	}
 
-	// 4) gang 调度队列：优先级高者先尝试，放不下则跳过尝试后续作业。
+	// 4) 计划内维护：把排空中节点上的在执行行任务安全迁走，迁空则退役。
+	s.drainNodesLocked(now)
+
+	// 5) gang 调度队列：优先级高者先尝试，放不下则跳过尝试后续作业。
 	s.schedulePendingLocked(now)
 
-	// 5) 推进执行。
+	// 6) 推进执行。
 	s.exec.Tick()
 	s.drainEventsLocked() // 立即吸纳本轮完成事件，使 Tick 返回时状态确定
 
@@ -410,6 +472,118 @@ func recomputeJobAfterReset(j *api.JobRuntime) {
 	}
 }
 
+// drainNodesLocked 推进所有排空中节点：把其上在执行行任务逐个安全迁移到
+// 其他健康节点；放不下的任务保持原地继续运行，下一 tick 再试，不影响正确性
+// （节点继续续心跳，不会被误判故障）。某节点任务全部迁空后正式退役，
+// 容量自此从集群可用容量中扣除。
+func (s *Scheduler) drainNodesLocked(now int64) {
+	for _, nodeID := range s.pool.DrainingIDs() {
+		s.drainOneNodeLocked(nodeID, now)
+	}
+}
+
+// drainCandidate 是一个待迁移任务的确定性描述。
+type drainCandidate struct {
+	jobID    string
+	taskName string
+	priority int
+	index    int
+	request  api.Resource
+}
+
+func (s *Scheduler) drainOneNodeLocked(nodeID string, now int64) {
+	// 收集该节点上全部“确实在执行行”的运行中任务，按作业优先级降序、
+	// 作业 ID 升序、任务下标升序确定迁移顺序。
+	var cands []drainCandidate
+	for _, j := range s.store.List() {
+		for i, t := range j.Tasks {
+			if t.State == api.TaskRunning && t.NodeID == nodeID &&
+				s.exec.Running(j.Spec.ID, t.Spec.Name) {
+				cands = append(cands, drainCandidate{
+					jobID: j.Spec.ID, taskName: t.Spec.Name, priority: j.Spec.Priority,
+					index: i, request: t.Spec.Resources,
+				})
+			}
+		}
+	}
+	sort.Slice(cands, func(i, k int) bool {
+		if cands[i].priority != cands[k].priority {
+			return cands[i].priority > cands[k].priority
+		}
+		if cands[i].jobID != cands[k].jobID {
+			return cands[i].jobID < cands[k].jobID
+		}
+		return cands[i].index < cands[k].index
+	})
+
+	migrated := 0
+	for _, c := range cands {
+		if s.tryMigrateTaskLocked(nodeID, c) {
+			migrated++
+		}
+	}
+
+	// 重新以存储事实清点：该节点上是否还有运行中任务。
+	remaining := 0
+	for _, j := range s.store.List() {
+		for _, t := range j.Tasks {
+			if t.State == api.TaskRunning && t.NodeID == nodeID {
+				remaining++
+			}
+		}
+	}
+	if remaining == 0 && s.pool.RetireIfEmpty(nodeID) {
+		// 退役状态立即落盘，重启后保持退役。
+		if err := s.store.Persist(); err != nil {
+			s.log.Error("persist retire state failed", "node", nodeID, "err", err)
+		}
+		s.log.Warn("node drained and retired, capacity removed from cluster",
+			"node", nodeID, "clock", now)
+		return
+	}
+	if len(cands) > 0 {
+		s.log.Info("node drain in progress",
+			"node", nodeID, "migrated", migrated, "remaining", remaining, "clock", now)
+	}
+}
+
+// tryMigrateTaskLocked 尝试把单个任务从排空节点在线迁移到某个健康节点。
+// 全程在 s.mu 内串行完成“选目标 -> 账本原子迁移 -> 执行行改挂 -> 任务视图更新”，
+// 任何一步失败都整体回滚或整体未发生：不丢任务、不重复占用。
+// 迁移保留剩余节拍、Attempt 不增加（与故障被杀重调度相区别）。
+func (s *Scheduler) tryMigrateTaskLocked(from string, c drainCandidate) bool {
+	target := s.pool.PlanTarget(c.request, from)
+	if target == "" {
+		return false // 当前没有放得下的健康节点：任务原地继续跑，下 tick 再试
+	}
+	if !s.pool.MigrateOne(from, target, c.request) {
+		return false // 并发状态变化导致目标不可用：本 tick 放弃
+	}
+	if !s.exec.Migrate(c.jobID, c.taskName, from, target) {
+		// 理论不可达：收集候选时确认过在执行行；回滚账本，保证两边一致。
+		s.pool.UndoMigrate(from, target, c.request)
+		return false
+	}
+	_, err := s.store.Update(c.jobID, func(j *api.JobRuntime) {
+		for i := range j.Tasks {
+			if j.Tasks[i].Spec.Name == c.taskName &&
+				j.Tasks[i].State == api.TaskRunning && j.Tasks[i].NodeID == from {
+				j.Tasks[i].NodeID = target
+				return
+			}
+		}
+	})
+	if err != nil {
+		// 理论不可达：候选来自存储；回滚执行行与账本。
+		s.exec.Migrate(c.jobID, c.taskName, target, from)
+		s.pool.UndoMigrate(from, target, c.request)
+		return false
+	}
+	s.log.Warn("task live-migrated off draining node",
+		"job", c.jobID, "task", c.taskName, "from", from, "to", target)
+	return true
+}
+
 // schedulePendingLocked 按优先级（高->低）、同优先级按 ID 排序遍历 Pending 作业，
 // 对每个作业做全有或全无的放置；放不下则保留 Pending，继续尝试后续作业
 // （队头不阻塞），保证不同调度顺序下结果确定且可解释。
@@ -519,11 +693,37 @@ func (s *Scheduler) Recover() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	counter, recovered, err := s.store.Recover()
+	counter, recovered, nodeRecs, err := s.store.Recover()
 	if err != nil {
 		return 0, err
 	}
 	s.exec.Reset()
+
+	// 重放节点生命周期：维护中/已退役/已死亡的状态必须跨重启保持，
+	// 绝不把排空中的节点恢复成健康机器而重新接收任务。
+	// 前提契约：节点须先用相同 ID 与容量重新注册（节点池本就从空白重建）。
+	registered := map[string]api.Resource{}
+	for _, n := range s.pool.Snapshot() {
+		registered[n.ID] = n.Capacity
+	}
+	for _, nr := range nodeRecs {
+		cap, ok := registered[nr.ID]
+		if !ok {
+			return 0, fmt.Errorf("recover: snapshot node %s not re-registered", nr.ID)
+		}
+		if cap != nr.Capacity {
+			return 0, fmt.Errorf("recover: node %s capacity %+v differs from snapshot %+v",
+				nr.ID, cap, nr.Capacity)
+		}
+		if err := s.pool.RestoreNodeState(nr.ID, nr.State); err != nil {
+			return 0, fmt.Errorf("recover: %w", err)
+		}
+		if nr.State != api.NodeHealthy {
+			s.alive[nr.ID] = nr.State != api.NodeDead // 死亡节点停止心跳；其余按快照
+			s.log.Info("node lifecycle restored", "node", nr.ID, "state", nr.State)
+		}
+	}
+
 	for _, j := range recovered {
 		reset := false
 		if j.State == api.JobSucceeded || j.State == api.JobFailed {

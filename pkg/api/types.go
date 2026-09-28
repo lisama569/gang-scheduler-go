@@ -8,8 +8,10 @@ type Resource struct {
 
 // 节点状态。
 const (
-	NodeHealthy = "Healthy"
-	NodeDead    = "Dead"
+	NodeHealthy  = "Healthy"  // 正常服役：可接收新任务
+	NodeDraining = "Draining" // 计划内维护/排空中：不接收新任务，已有任务安全迁出
+	NodeDead     = "Dead"     // 心跳超时故障：任务按丢失回收重调度
+	NodeRetired  = "Retired"  // 排空完成后正式退役：容量从集群可用容量中扣除
 )
 
 // 任务状态。
@@ -67,6 +69,13 @@ type NodeRuntime struct {
 	LastBeat int64 // 最近一次心跳的逻辑时钟
 }
 
+// NodeRecord 是持久化到状态存储的节点记录：拓扑容量 + 生命周期状态。
+type NodeRecord struct {
+	ID       string
+	Capacity Resource
+	State    string
+}
+
 // jobRecord / taskRecord 是持久化到状态存储的快照记录。
 type TaskRecord struct {
 	Spec    TaskSpec
@@ -82,8 +91,16 @@ type JobRecord struct {
 	Tasks  []TaskRecord
 }
 
+// DrainProgress 描述一个计划内维护节点的排空进展（供观测与测试断言）。
+type DrainProgress struct {
+	NodeID    string
+	State     string // NodeDraining（排空中）或 NodeRetired（已退役）
+	Remaining int    // 尚未迁走的在执行行任务数；退役时必为 0
+}
+
 // snapshot 是状态存储落盘的完整快照。
 type Snapshot struct {
 	Counter int
 	Jobs    []JobRecord
+	Nodes   []NodeRecord
 }

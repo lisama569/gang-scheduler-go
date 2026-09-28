@@ -95,6 +95,21 @@ func (e *Executor) KillOnNode(nodeID string) {
 	}
 }
 
+// Migrate 把一个正在 from 节点执行的任务“在线”改挂到 to 节点（计划内维护迁移）。
+// 与故障重调度的区别：任务不被杀、不复位、不重跑、Attempt 不增加、剩余节拍保留。
+// 仅当任务当前确实在 from 上执行时才生效；调用方必须先在账本层完成目标占用，
+// 迁移本身只改在执行行的归属，不触碰资源账本（账本迁移由 cluster.Pool 负责）。
+func (e *Executor) Migrate(jobID, taskName, from, to string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	inf, ok := e.running[inflightKey(jobID, taskName)]
+	if !ok || inf.nodeID != from {
+		return false
+	}
+	inf.nodeID = to
+	return true
+}
+
 // Tick 推进所有在执行行一个节拍；到达 0 的任务正常结束并投递 EvFinished。
 func (e *Executor) Tick() {
 	e.mu.Lock()
