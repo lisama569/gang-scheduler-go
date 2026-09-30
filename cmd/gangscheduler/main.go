@@ -105,10 +105,15 @@ func main() {
 		Logger:                logger,
 	})
 	must(s2.AddNode("node-a", api.Resource{CPU: 4, Memory: 8}))
-	must(s2.AddNode("node-c", api.Resource{CPU: 4, Memory: 8}))
+	// node-c 在第一次进程里已完成排空、正式退役。重启后直接重新注册
+	// 同名节点会被拒绝：已下线节点不会被隐式复活，容量不会涨回去。
+	err = s2.AddNode("node-c", api.Resource{CPU: 4, Memory: 8})
+	fmt.Printf("re-register retired node-c rejected as: %v\n", err)
 	ver, err := s2.Recover()
 	must(err)
 	fmt.Printf("recovered snapshot version=%d\n", ver)
+	fmt.Println("nodes after recovery (node-c absent -> capacity stays shrunken):")
+	printNodes(s2)
 
 	// 已结束作业不会复活，重复提交被拒绝。
 	err = s2.Submit(api.JobSpec{ID: "job-app", Priority: 10,
@@ -126,6 +131,18 @@ func main() {
 	}
 	printJob(s2, "job-after-restart")
 	printNodes(s2)
+
+	// 运维显式让 node-c 重新上线（区别于隐式重新注册）：容量重新计入集群。
+	must(s2.ReadmitNode("node-c", api.Resource{CPU: 4, Memory: 8}))
+	fmt.Println("node-c explicitly readmitted:")
+	printNodes(s2)
+	must(s2.Submit(api.JobSpec{ID: "job-after-readmit", Priority: 1,
+		Tasks: []api.TaskSpec{
+			{Name: "p", Resources: api.Resource{CPU: 3, Memory: 2}, Duration: 2},
+		}}))
+	s2.Tick() // 放到重新上线的 node-c
+	s2.Tick()
+	printJob(s2, "job-after-readmit")
 	fmt.Println("demo finished")
 }
 
@@ -143,7 +160,8 @@ func printJob(s *scheduler.Scheduler, id string) {
 	}
 	fmt.Printf("job %s state=%s reason=%q\n", id, j.State, j.Reason)
 	for _, t := range j.Tasks {
-		fmt.Printf("  task %s state=%s node=%s attempt=%d\n", t.Spec.Name, t.State, t.NodeID, t.Attempt)
+		fmt.Printf("  task %s state=%s node=%s attempt=%d progress=%d/%d\n",
+			t.Spec.Name, t.State, t.NodeID, t.Attempt, t.Progress, t.Spec.Duration)
 	}
 }
 

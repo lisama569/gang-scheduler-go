@@ -55,6 +55,12 @@ func New(cfg Config) *Scheduler {
 	events := make(chan execution.Event, 1024)
 	pool := cluster.NewPool()
 	store := state.New(cfg.StateFile)
+	// 先把快照中的节点标记（排空/退役名单）加载进内存：
+	// 即使调用方在 Recover 之前就 AddNode，已退役节点也会被立刻拦住，
+	// 不会被当成新机器注册、让容量涨回去。
+	if err := store.LoadMarkers(); err != nil {
+		log.Warn("failed to preload node markers from snapshot", "err", err.Error())
+	}
 	s := &Scheduler{
 		pool:    pool,
 		store:   store,
@@ -69,9 +75,19 @@ func New(cfg Config) *Scheduler {
 }
 
 // AddNode 注册一个模拟节点。
+//
+// 若该节点 ID 在持久化快照中已被标记为“正式退役”（排空完成后的永久下线），
+// AddNode 会返回 api.ErrNodeRetired 拒绝注册：已下线节点不会因为重启后
+// 重新注册而被当成健康机器复活，集群容量也不会因此涨回去。运维确实要把
+// 这台机器重新上线时，必须显式调用 ReadmitNode。
 func (s *Scheduler) AddNode(id string, cap api.Resource) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.store.IsRetired(id) {
+		s.log.Warn("node registration rejected: node is retired (capacity permanently removed)",
+			"node", id)
+		return api.ErrNodeRetired
+	}
 	if err := s.pool.AddNode(id, cap); err != nil {
 		return err
 	}
@@ -85,6 +101,30 @@ func (s *Scheduler) AddNode(id string, cap api.Resource) error {
 		}
 	}
 	s.log.Info("node registered", "node", id, "capacity", cap)
+	return nil
+}
+
+// ReadmitNode 显式让一台此前已退役（CompleteNodeDrain 正式下线）的节点重新上线：
+// 节点恢复为 Healthy、以给定容量重新计入集群并恢复心跳。
+// 这是运维的**显式重新上线**操作，与“重启后重新 AddNode”不同——后者会被拒绝，
+// 保证已下线节点不可能被隐式复活。
+// 节点既不在退役名单、节点池里也没有（从未出现过的 ID）时返回
+// ErrNodeNotRetired；普通新机器请走 AddNode。
+func (s *Scheduler) ReadmitNode(id string, cap api.Resource) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.store.IsRetired(id) {
+		s.log.Warn("readmit rejected: node was never retired", "node", id)
+		return api.ErrNodeNotRetired
+	}
+	if err := s.pool.ReadmitNode(id, cap); err != nil {
+		return err
+	}
+	if err := s.store.ClearNodeRetired(id); err != nil {
+		return fmt.Errorf("persist readmit state: %w", err)
+	}
+	s.alive[id] = true
+	s.log.Info("retired node explicitly readmitted as healthy", "node", id, "capacity", cap)
 	return nil
 }
 
@@ -268,9 +308,12 @@ func (s *Scheduler) CompleteNodeDrain(nodeID string) error {
 	if err := s.pool.CompleteDrain(nodeID); err != nil {
 		return err
 	}
-	// 退役后清除排空标记并落盘；节点不再参与心跳（已 Dead）。
-	if err := s.store.SetDraining(nodeID, false); err != nil {
-		return fmt.Errorf("persist drain state: %w", err)
+	// 退役后把节点从排空名单移入“已退役”名单并一次性落盘：
+	// 这是永久容量收缩——重启后重新注册同名节点会被 AddNode 拒绝，
+	// 容量不会涨回来；只有运维显式 ReadmitNode 才能重新上线。
+	// 节点不再参与心跳（已 Dead）。
+	if err := s.store.MarkNodeRetired(nodeID); err != nil {
+		return fmt.Errorf("persist retired state: %w", err)
 	}
 	delete(s.alive, nodeID)
 	s.log.Info("node drain complete, node retired",
@@ -373,6 +416,16 @@ func (s *Scheduler) Tick() {
 			"node", dead.ID, "clock", now, "released", dead.Released)
 		s.exec.KillOnNode(dead.ID) // 产生的 EvKilled 进入通道
 		s.drainEventsLocked()      // 同步完成任务复位，保证本 tick 状态可断言
+		// 若该节点此前处于计划内排空中，故障回收使它直接进入 Dead：
+		// 排空生命周期到此终止，清除残留排空标记（它不是退役，
+		// 也不进入退役名单），避免重启后标记悬空。
+		if s.store.IsDraining(dead.ID) {
+			if err := s.store.SetDraining(dead.ID, false); err != nil {
+				s.log.Warn("clear stale draining marker failed",
+					"node", dead.ID, "err", err.Error())
+			}
+		}
+		delete(s.alive, dead.ID)
 	}
 
 	// 3.5) 计划内维护：驱逐排空中节点上仍在运行的任务（安全迁移，不算故障丢失）。
@@ -385,12 +438,41 @@ func (s *Scheduler) Tick() {
 	// 4) gang 调度队列：优先级高者先尝试，放不下则跳过尝试后续作业。
 	s.schedulePendingLocked(now)
 
-	// 5) 推进执行。
-	s.exec.Tick()
+	// 5) 推进执行。未结束任务的最新进度按作业聚合后落盘：
+	// 计划内迁移或崩溃都能带着进度续跑，而不是从头重跑。
+	progress := s.exec.Tick()
 	s.drainEventsLocked() // 立即吸纳本轮完成事件，使 Tick 返回时状态确定
+	s.persistProgressLocked(progress)
 
 	s.clock = now
 	s.mu.Unlock()
+}
+
+// persistProgressLocked 把本 tick 各在执行行的最新进度聚合到作业快照中。
+// 同一作业的多个任务只触发一次落盘，避免每个任务一次磁盘写入。
+func (s *Scheduler) persistProgressLocked(ticks []execution.ProgressTick) {
+	if len(ticks) == 0 {
+		return
+	}
+	byJob := map[string]map[string]int{}
+	for _, tk := range ticks {
+		if byJob[tk.JobID] == nil {
+			byJob[tk.JobID] = map[string]int{}
+		}
+		byJob[tk.JobID][tk.TaskName] = tk.Progress
+	}
+	for jobID, taskProgress := range byJob {
+		if _, err := s.store.Update(jobID, func(live *api.JobRuntime) {
+			for i := range live.Tasks {
+				t := &live.Tasks[i]
+				if p, ok := taskProgress[t.Spec.Name]; ok && t.State == api.TaskRunning && p > t.Progress {
+					t.Progress = p
+				}
+			}
+		}); err != nil {
+			s.log.Warn("persist task progress failed", "job", jobID, "err", err.Error())
+		}
+	}
 }
 
 // drainEventsLocked 非阻塞地处理完当前通道内的全部任务事件。
@@ -426,11 +508,12 @@ func (s *Scheduler) handleEventLocked(ev execution.Event) {
 	task := &j.Tasks[idx]
 
 	switch ev.Kind {
-	case execution.EvKilled, execution.EvDrained:
-		// 只有“当时确实跑在该节点上”的运行中任务才复位；
+	case execution.EvKilled:
+		// 故障语义：只有“当时确实跑在该节点上”的运行中任务才复位；
 		// 已完成（Succeeded/Failed）任务保留结果，绝不重跑。
+		// 故障丢失执行现场，任务从头重跑（Progress 清零）、Attempt+1。
 		if task.State != api.TaskRunning || task.NodeID != ev.NodeID {
-			s.log.Info("stale kill/drain event ignored",
+			s.log.Info("stale kill event ignored",
 				"job", ev.JobID, "task", ev.TaskName,
 				"state", task.State, "node", task.NodeID, "srcNode", ev.NodeID)
 			return
@@ -438,19 +521,39 @@ func (s *Scheduler) handleEventLocked(ev execution.Event) {
 		task.State = api.TaskPending
 		task.NodeID = ""
 		task.Attempt++
+		task.Progress = 0
 		recomputeJobAfterReset(j)
 		s.store.Update(ev.JobID, func(live *api.JobRuntime) {
 			*live = *j
 		})
-		if ev.Kind == execution.EvDrained {
-			s.log.Info("task evicted for node maintenance, queued for migration",
+		s.log.Warn("task killed by node failure, restarted from scratch and queued for reschedule",
+			"job", ev.JobID, "task", ev.TaskName,
+			"deadNode", ev.NodeID, "attempt", task.Attempt)
+
+	case execution.EvDrained:
+		// 计划内维护语义（与故障严格区分）：任务是被安全驱逐、不是丢失，
+		// 复位为 Pending 但保留已执行进度、Attempt 不增长，
+		// 随本 tick 的 gang 调度整体迁到健康节点接着原来的进度跑。
+		if task.State != api.TaskRunning || task.NodeID != ev.NodeID {
+			s.log.Info("stale drain event ignored",
 				"job", ev.JobID, "task", ev.TaskName,
-				"drainingNode", ev.NodeID, "attempt", task.Attempt)
-		} else {
-			s.log.Warn("task killed and queued for reschedule",
-				"job", ev.JobID, "task", ev.TaskName,
-				"deadNode", ev.NodeID, "attempt", task.Attempt)
+				"state", task.State, "node", task.NodeID, "srcNode", ev.NodeID)
+			return
 		}
+		task.State = api.TaskPending
+		task.NodeID = ""
+		if ev.Progress > task.Progress {
+			task.Progress = ev.Progress
+		}
+		// Attempt 刻意不变：主动维护迁移不是一次故障重试。
+		recomputeJobAfterReset(j)
+		s.store.Update(ev.JobID, func(live *api.JobRuntime) {
+			*live = *j
+		})
+		s.log.Info("task evicted for planned maintenance, migrating with progress preserved",
+			"job", ev.JobID, "task", ev.TaskName,
+			"drainingNode", ev.NodeID, "progress", task.Progress,
+			"attempt", task.Attempt)
 
 	case execution.EvFinished:
 		// 只接受 Running 任务的完成事件；重复事件被忽略，防止重复计数。
@@ -461,8 +564,12 @@ func (s *Scheduler) handleEventLocked(ev execution.Event) {
 		}
 		if ev.OK {
 			task.State = api.TaskSucceeded
+			if ev.Progress > 0 {
+				task.Progress = ev.Progress
+			}
 			s.log.Info("task succeeded",
-				"job", ev.JobID, "task", ev.TaskName, "node", ev.NodeID)
+				"job", ev.JobID, "task", ev.TaskName, "node", ev.NodeID,
+				"progress", task.Progress)
 		} else {
 			task.State = api.TaskFailed
 			s.log.Warn("task failed by fault injection",
@@ -644,6 +751,16 @@ func (s *Scheduler) Recover() (int, error) {
 			s.log.Info("re-applied draining state after restart", "node", id)
 		}
 	}
+	// 恢复退役名单：已正式下线的节点即使重启后被重新注册，也必须
+	// 保持 Dead、容量不计入集群（AddNode 会按名单拒绝隐式复活；
+	// 若节点在 Recover 之前已注册，这里立即把它压回退役态）。
+	for _, id := range s.store.Retired() {
+		if err := s.pool.MarkRetired(id); err == nil {
+			delete(s.alive, id)
+			s.log.Info("re-applied retired state after restart, capacity stays shrunken",
+				"node", id)
+		}
+	}
 	for _, j := range recovered {
 		reset := false
 		if j.State == api.JobSucceeded || j.State == api.JobFailed {
@@ -654,6 +771,9 @@ func (s *Scheduler) Recover() (int, error) {
 		for i := range j.Tasks {
 			t := &j.Tasks[i]
 			if t.State == api.TaskRunning {
+				// 进程崩溃属于非计划中断（执行行随进程消失）：
+				// Attempt+1 记录这次重启重试，但崩溃前已执行的进度
+				// （随每次 Tick 落盘）予以保留，任务重新放置后接着进度跑。
 				t.State = api.TaskPending
 				t.NodeID = ""
 				t.Attempt++

@@ -23,10 +23,19 @@ type Store struct {
 	// draining 记录处于维护/排空中的节点 ID，随快照一起落盘，
 	// 保证重启恢复后排空中的节点不会被当成健康机器重新投入调度。
 	draining map[string]bool
+	// retired 记录已完成排空、正式退役的节点 ID。
+	// 退役是永久容量收缩：重启后同名节点重新注册不会复活，
+	// 容量不会重新计入集群，除非运维显式 ReadmitNode。
+	retired map[string]bool
 }
 
 func New(path string) *Store {
-	return &Store{path: path, jobs: map[string]*api.JobRuntime{}, draining: map[string]bool{}}
+	return &Store{
+		path:     path,
+		jobs:     map[string]*api.JobRuntime{},
+		draining: map[string]bool{},
+		retired:  map[string]bool{},
+	}
 }
 
 func cloneTask(t api.TaskRuntime) api.TaskRuntime {
@@ -36,9 +45,10 @@ func cloneTask(t api.TaskRuntime) api.TaskRuntime {
 			Resources: t.Spec.Resources,
 			Duration:  t.Spec.Duration,
 		},
-		State:   t.State,
-		NodeID:  t.NodeID,
-		Attempt: t.Attempt,
+		State:    t.State,
+		NodeID:   t.NodeID,
+		Attempt:  t.Attempt,
+		Progress: t.Progress,
 	}
 }
 
@@ -129,13 +139,52 @@ func (s *Store) Draining() []string {
 	return out
 }
 
+// SetRetired 记录/清除一个节点的退役标记并立即落盘。
+// 调用方必须持有上层串行化锁。
+func (s *Store) SetRetired(nodeID string, on bool) error {
+	if on {
+		s.retired[nodeID] = true
+	} else {
+		delete(s.retired, nodeID)
+	}
+	return s.Persist()
+}
+
+// IsRetired 查询节点是否已正式退役（容量永久退出集群）。
+func (s *Store) IsRetired(nodeID string) bool { return s.retired[nodeID] }
+
+// Retired 返回全部已退役节点 ID 的确定性排序列表。
+func (s *Store) Retired() []string {
+	out := make([]string, 0, len(s.retired))
+	for id := range s.retired {
+		out = append(out, id)
+	}
+	sortStrings(out)
+	return out
+}
+
+// MarkNodeRetired 一次性把节点从“排空中”移入“已退役”名单并落盘：
+// 删除排空标记、加入退役名单。排空退役必须是原子的一次状态迁移，
+// 避免两个标记短暂不一致时重启造成节点语义悬空。
+func (s *Store) MarkNodeRetired(nodeID string) error {
+	delete(s.draining, nodeID)
+	s.retired[nodeID] = true
+	return s.Persist()
+}
+
+// ClearNodeRetired 清除退役标记（运维显式 ReadmitNode 重新上线）并落盘。
+func (s *Store) ClearNodeRetired(nodeID string) error {
+	delete(s.retired, nodeID)
+	return s.Persist()
+}
+
 // Persist 将当前内存状态原子写盘：先写临时文件再 rename，并推进版本号。
 func (s *Store) Persist() error {
 	if s.path == "" {
 		s.counter++
 		return nil
 	}
-	snap := api.Snapshot{Counter: s.counter + 1, Draining: s.Draining()}
+	snap := api.Snapshot{Counter: s.counter + 1, Draining: s.Draining(), Retired: s.Retired()}
 	ids := make([]string, 0, len(s.jobs))
 	for id := range s.jobs {
 		ids = append(ids, id)
@@ -150,7 +199,13 @@ func (s *Store) Persist() error {
 			Tasks:  make([]api.TaskRecord, len(j.Tasks)),
 		}
 		for i, t := range j.Tasks {
-			rec.Tasks[i] = api.TaskRecord{Spec: t.Spec, State: t.State, NodeID: t.NodeID, Attempt: t.Attempt}
+			rec.Tasks[i] = api.TaskRecord{
+				Spec:     t.Spec,
+				State:    t.State,
+				NodeID:   t.NodeID,
+				Attempt:  t.Attempt,
+				Progress: t.Progress,
+			}
 		}
 		snap.Jobs = append(snap.Jobs, rec)
 	}
@@ -170,6 +225,34 @@ func (s *Store) Persist() error {
 		return err
 	}
 	s.counter++
+	return nil
+}
+
+// LoadMarkers 只从快照加载节点标记（排空/退役名单），不动作业表。
+// 用途：重启后新调度器在调用 Recover 之前就可能先 AddNode 注册节点，
+// 此时退役/排空标记必须已经就位，才能拦住“把已下线节点重新注册复活”。
+// 标记按并集合并；快照不存在不是错误（全新集群）。
+func (s *Store) LoadMarkers() error {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var snap api.Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return fmt.Errorf("decode snapshot markers: %w", err)
+	}
+	for _, id := range snap.Draining {
+		s.draining[id] = true
+	}
+	for _, id := range snap.Retired {
+		s.retired[id] = true
+	}
+	if snap.Counter > s.counter {
+		s.counter = snap.Counter
+	}
 	return nil
 }
 
@@ -206,7 +289,13 @@ func (s *Store) Recover() (int, []*api.JobRuntime, error) {
 			Tasks:  make([]api.TaskRuntime, len(rec.Tasks)),
 		}
 		for i, tr := range rec.Tasks {
-			j.Tasks[i] = api.TaskRuntime{Spec: tr.Spec, State: tr.State, NodeID: tr.NodeID, Attempt: tr.Attempt}
+			j.Tasks[i] = api.TaskRuntime{
+				Spec:     tr.Spec,
+				State:    tr.State,
+				NodeID:   tr.NodeID,
+				Attempt:  tr.Attempt,
+				Progress: tr.Progress,
+			}
 		}
 		s.jobs[rec.Spec.ID] = j
 		added = append(added, cloneJob(j))
@@ -218,6 +307,10 @@ func (s *Store) Recover() (int, []*api.JobRuntime, error) {
 	// 内存中已有的标记（恢复与并发排空交错时更新）也不被旧快照回退。
 	for _, id := range snap.Draining {
 		s.draining[id] = true
+	}
+	// 退役名单同理按并集合并：已永久下线的节点不会因重启而复活。
+	for _, id := range snap.Retired {
+		s.retired[id] = true
 	}
 	return snap.Counter, added, nil
 }

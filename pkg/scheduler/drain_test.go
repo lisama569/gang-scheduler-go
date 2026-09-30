@@ -78,8 +78,14 @@ func TestDrainMigratesTasks(t *testing.T) {
 	if j.Tasks[1].State != api.TaskRunning || j.Tasks[1].NodeID != "n3" {
 		t.Fatalf("t2 must migrate to healthy n3, got %+v", j.Tasks[1])
 	}
-	if j.Tasks[1].Attempt != 1 {
-		t.Fatalf("t2 attempt should be 1 after migration, got %d", j.Tasks[1].Attempt)
+	// 计划内维护迁移不是故障：Attempt 保持 0，且任务带着已执行进度续跑。
+	// t2 在 n2 上跑完了 tick1（迁移前 progress=1）；tick2 内迁到 n3，
+	// tick 末执行器在 n3 上又推进一拍，因此此刻 progress=2。
+	if j.Tasks[1].Attempt != 0 {
+		t.Fatalf("planned migration must NOT bump attempt, got %d", j.Tasks[1].Attempt)
+	}
+	if j.Tasks[1].Progress != 2 {
+		t.Fatalf("t2 must keep progress across migration, got progress=%d", j.Tasks[1].Progress)
 	}
 	if j.Tasks[0].State != api.TaskRunning || j.Tasks[0].NodeID != "n1" {
 		t.Fatalf("t1 must be undisturbed on n1: %+v", j.Tasks[0])
@@ -112,9 +118,13 @@ func TestDrainMigratesTasks(t *testing.T) {
 	if j.State != api.JobSucceeded {
 		t.Fatalf("job must succeed after migration: %s (%+v)", j.State, j.Tasks)
 	}
-	// t2 只在 n3 上完整执行了一次（attempt=1），没有被重复统计。
-	if j.Tasks[1].NodeID != "n3" || j.Tasks[1].Attempt != 1 {
+	// t2 在 n3 上从 progress=1 接着跑，只补跑剩余的 5 拍；
+	// 计划内迁移不算故障重试：attempt 始终为 0，没有被重复统计。
+	if j.Tasks[1].NodeID != "n3" || j.Tasks[1].Attempt != 0 {
 		t.Fatalf("t2 final: %+v", j.Tasks[1])
+	}
+	if j.Tasks[1].State != api.TaskSucceeded || j.Tasks[1].Progress != 6 {
+		t.Fatalf("t2 must finish once with full progress 6: %+v", j.Tasks[1])
 	}
 	if n := nodeState(t, s, "n2"); n.Used != (api.Resource{}) {
 		t.Fatalf("retired n2 must hold no resources: %+v", n)

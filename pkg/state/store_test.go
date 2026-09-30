@@ -101,3 +101,74 @@ func TestStoreUpdateMissing(t *testing.T) {
 		t.Fatalf("missing update must return ErrJobNotFound, got %v", err)
 	}
 }
+
+// TestStoreRetiredAndProgressRoundTrip 退役名单与任务进度必须随快照落盘、
+// 重新打开后原样恢复；MarkNodeRetired 是“排空 -> 退役”的原子迁移
+// （同一次落盘内删排空标记、加退役标记）。
+func TestStoreRetiredAndProgressRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", "snapshot.json")
+	s1 := New(path)
+	j := sampleJob("j", api.JobRunning)
+	j.Tasks[0].Progress = 7
+	if err := s1.Add(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.SetDraining("n2", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.MarkNodeRetired("n2"); err != nil {
+		t.Fatal(err)
+	}
+	if s1.IsDraining("n2") || !s1.IsRetired("n2") {
+		t.Fatalf("n2 must move draining -> retired atomically")
+	}
+	if err := s1.SetDraining("n3", true); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := New(path)
+	if err := s2.LoadMarkers(); err != nil {
+		t.Fatal(err)
+	}
+	// LoadMarkers 只加载标记，作业表仍为空。
+	if len(s2.List()) != 0 {
+		t.Fatalf("LoadMarkers must not load jobs: %d", len(s2.List()))
+	}
+	if !s2.IsRetired("n2") || !s2.IsDraining("n3") {
+		t.Fatalf("markers not preloaded: retired=%v draining=%v", s2.IsRetired("n2"), s2.IsDraining("n3"))
+	}
+	if _, _, err := s2.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	rj, ok := s2.Get("j")
+	if !ok {
+		t.Fatal("job missing after recover")
+	}
+	if rj.Tasks[0].Progress != 7 {
+		t.Fatalf("progress must survive snapshot round trip: %+v", rj.Tasks[0])
+	}
+	if !s2.IsRetired("n2") || s2.IsDraining("n2") || !s2.IsDraining("n3") {
+		t.Fatalf("retired/draining sets wrong after recover: retired=%s draining=%s",
+			s2.Retired(), s2.Draining())
+	}
+
+	// ReadmitNode 对应的清理：清除退役标记后再次往返，n2 不再被视为退役。
+	if err := s2.ClearNodeRetired("n2"); err != nil {
+		t.Fatal(err)
+	}
+	s3 := New(path)
+	if _, _, err := s3.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if s3.IsRetired("n2") {
+		t.Fatal("n2 retired marker must be cleared after explicit readmit")
+	}
+}
+
+// TestStoreLoadMarkersMissingFile 全新集群（快照文件尚不存在）不是错误。
+func TestStoreLoadMarkersMissingFile(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "absent.json"))
+	if err := s.LoadMarkers(); err != nil {
+		t.Fatalf("missing snapshot must be a no-op: %v", err)
+	}
+}

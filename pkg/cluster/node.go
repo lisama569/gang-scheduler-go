@@ -56,6 +56,33 @@ func (n *Node) Retire() bool {
 	return true
 }
 
+// MarkRetired 直接把节点标记为退役（Dead）并清空占用账本。
+// 用于重启恢复：快照记录为“已退役”的节点重新注册时必须仍按退役处理，
+// 绝不能作为健康机器复活、让容量涨回去。
+func (n *Node) MarkRetired() {
+	n.rt.State = api.NodeDead
+	n.rt.Used = api.Resource{}
+}
+
+// Readmit 把一个已退役（Dead）节点作为运维显式重新上线的机器恢复为健康状态，
+// 账本清零、心跳时间戳由后续 Beat 刷新。
+// 节点不是退役态（仍健康/排空中）时返回 false，避免“重新上线”被误用于
+// 摘除一台正在服务的机器。
+func (n *Node) Readmit() bool {
+	if n.rt.State != api.NodeDead {
+		return false
+	}
+	n.rt.State = api.NodeHealthy
+	n.rt.Used = api.Resource{}
+	return true
+}
+
+// replaceCapacity 以新容量重建一个已存在节点的容量视图（重新上线时可携带新规格）。
+func (n *Node) replaceCapacity(capacity api.Resource) {
+	n.rt.Capacity = capacity
+	n.rt.Used = api.Resource{}
+}
+
 func (n *Node) isHealthy() bool { return n.rt.State == api.NodeHealthy }
 
 // isAlive 表示节点仍“活着”（健康或计划内排空中），需要心跳、会被超时检测。

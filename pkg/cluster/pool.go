@@ -35,6 +35,10 @@ func NewPool() *Pool {
 func (p *Pool) AddNode(id string, capacity api.Resource) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.addNodeLocked(id, capacity)
+}
+
+func (p *Pool) addNodeLocked(id string, capacity api.Resource) error {
 	if _, ok := p.nodes[id]; ok {
 		return fmt.Errorf("node %s already registered", id)
 	}
@@ -43,6 +47,46 @@ func (p *Pool) AddNode(id string, capacity api.Resource) error {
 	}
 	p.nodes[id] = NewNode(id, capacity)
 	p.order = append(p.order, id)
+	return nil
+}
+
+// MarkRetired 把已注册节点直接标记为退役（Dead）并清空占用。
+// 用于重启恢复后应用快照中的退役名单：已下线节点重新注册时仍按
+// 永久下线处理，容量不计入集群。节点未注册返回 ErrNodeNotFound。
+func (p *Pool) MarkRetired(id string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n, ok := p.nodes[id]
+	if !ok {
+		return api.ErrNodeNotFound
+	}
+	n.MarkRetired()
+	return nil
+}
+
+// ReadmitNode 显式让一台此前退役（Dead）的节点重新上线：
+// 已注册且处于 Dead 的节点恢复为 Healthy（可携带新容量）；
+// 节点从未注册时按新机器注册。
+// 节点当前仍 Healthy/Draining 时返回 ErrNodeNotRetired，
+// 避免把正在服务的机器借“重新上线”之名重建。
+func (p *Pool) ReadmitNode(id string, capacity api.Resource) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if capacity.CPU < 0 || capacity.Memory < 0 {
+		return fmt.Errorf("node %s has negative capacity", id)
+	}
+	n, ok := p.nodes[id]
+	if !ok {
+		return p.addNodeLocked(id, capacity)
+	}
+	snap := n.Snapshot()
+	if snap.State != api.NodeDead {
+		return api.ErrNodeNotRetired
+	}
+	if !n.Readmit() {
+		return api.ErrNodeNotRetired
+	}
+	n.replaceCapacity(capacity)
 	return nil
 }
 

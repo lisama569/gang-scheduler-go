@@ -24,6 +24,10 @@ type Event struct {
 	NodeID   string
 	Request  api.Resource
 	OK       bool
+	// Progress 是任务在该节点上已经执行完的 tick 数。
+	// 计划内驱逐（EvDrained）时调度器据此把任务带着进度迁到新节点续跑；
+	// 故障杀死（EvKilled）的进度不被保留，任务从头重跑且 Attempt+1。
+	Progress int
 }
 
 // Executor 在模拟节点上驱动任务执行：按 tick 推进剩余节拍，
@@ -44,7 +48,9 @@ type inflight struct {
 	taskName  string
 	nodeID    string
 	request   api.Resource
-	remaining int
+	total     int // 任务总 tick 数（Duration）
+	progress  int // 已经执行完的 tick 数（含此前在其它节点完成的部分）
+	remaining int // 还需执行的 tick 数 = total - progress
 }
 
 func inflightKey(jobID, taskName string) string { return jobID + "\x00" + taskName }
@@ -53,7 +59,9 @@ func New(pool *cluster.Pool, events chan<- Event) *Executor {
 	return &Executor{pool: pool, events: events, running: map[string]*inflight{}}
 }
 
-// Launch 登记一个开始执行的任务。重复登记同一任务会被拒绝（防御重复执行）。
+// Launch 登记一个开始执行的任务，startProgress 为它此前已经执行完的 tick 数
+// （计划内迁移续跑时 > 0；首次启动或故障重跑时为 0）。
+// 重复登记同一任务会被拒绝（防御重复执行）。
 func (e *Executor) Launch(jobID string, t api.TaskRuntime) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -61,12 +69,21 @@ func (e *Executor) Launch(jobID string, t api.TaskRuntime) bool {
 	if _, ok := e.running[key]; ok {
 		return false
 	}
+	progress := t.Progress
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > t.Spec.Duration {
+		progress = t.Spec.Duration
+	}
 	e.running[key] = &inflight{
 		jobID:     jobID,
 		taskName:  t.Spec.Name,
 		nodeID:    t.NodeID,
 		request:   t.Spec.Resources,
-		remaining: t.Spec.Duration,
+		total:     t.Spec.Duration,
+		progress:  progress,
+		remaining: t.Spec.Duration - progress,
 	}
 	return true
 }
@@ -119,19 +136,40 @@ func (e *Executor) EvictOnNode(nodeID string) {
 			TaskName: inf.taskName,
 			NodeID:   nodeID,
 			Request:  inf.request,
+			// 计划内迁移：带上在此节点已经跑完的进度，
+			// 调度器让任务在新节点上从该进度接着跑。
+			Progress: inf.progress,
 		}
 	}
 }
 
-// Tick 推进所有在执行行一个节拍；到达 0 的任务正常结束并投递 EvFinished。
-func (e *Executor) Tick() {
+// ProgressTick 汇报一个未结束任务在本 tick 完成后的最新执行进度，
+// 调度器据此把 Progress 落盘，使“迁到一半 / 跑到一半”的进度
+// 在崩溃恢复后依然可续。
+type ProgressTick struct {
+	JobID    string
+	TaskName string
+	Progress int
+}
+
+// Tick 推进所有在执行行一个节拍；到达 0 的任务正常结束并投递 EvFinished，
+// 其余仍在运行的任务返回各自的最新进度（由调用方持久化）。
+func (e *Executor) Tick() []ProgressTick {
 	e.mu.Lock()
 	var finished []*inflight
+	var ticks []ProgressTick
 	for key, inf := range e.running {
 		inf.remaining--
+		inf.progress++
 		if inf.remaining <= 0 {
 			finished = append(finished, inf)
 			delete(e.running, key)
+		} else {
+			ticks = append(ticks, ProgressTick{
+				JobID:    inf.jobID,
+				TaskName: inf.taskName,
+				Progress: inf.progress,
+			})
 		}
 	}
 	e.mu.Unlock()
@@ -145,8 +183,10 @@ func (e *Executor) Tick() {
 			NodeID:   inf.nodeID,
 			Request:  inf.request,
 			OK:       true,
+			Progress: inf.progress,
 		}
 	}
+	return ticks
 }
 
 // InjectFailure 令指定任务立即失败：释放资源并投递失败的 EvFinished。

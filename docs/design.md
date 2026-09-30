@@ -26,9 +26,12 @@
 - **节点**：有 `Capacity` 与 `Used` 账本、最近心跳时间戳，以及三种状态：
   - `Healthy`：正常参与调度；
   - `Draining`：计划内维护中——不再接收新任务，存量任务被安全迁出，心跳照常；
-  - `Dead`：故障被判死 **或** 排空完成后退役，容量永久退出集群。
+  - `Dead`：故障被判死、排空完成后退役，或重启后按退役名单压回的下线态，容量不参与调度。
 - **作业状态**：`Pending → Running → Succeeded/Failed`；
   **任务状态**：`Pending → Running → Succeeded/Failed`。
+- **任务执行计量**：`Attempt` 记录非计划中断后的重试次数（节点故障、进程崩溃各 +1）；
+  **计划内排空迁移不增加 `Attempt`**。`Progress` 记录已执行完的 tick 数，
+  计划内迁移与重启恢复都保留进度续跑；只有节点故障杀死会把进度清零、从头重跑。
 
 ## 3. 调度规则
 
@@ -92,50 +95,85 @@
    - 节点**心跳照常刷新**——它是计划内维护，不会被超时检测误判死。
    - 节点不存在 / 已排空中 / 已死亡分别返回
      `ErrNodeNotFound` / `ErrNodeNotHealthy`，可区分。
-2. **迁移（随 Tick 推进）**：每个 Tick 驱逐所有 `Draining` 节点上的在执行任务
-   （`Executor.EvictOnNode` → `EvDrained` 事件）。被驱逐任务**不算丢失**：
-   复位为 `Pending`、`Attempt+1`，随同一 tick 的 gang 调度整体迁到其它
-   有余量的健康节点；暂时放不下就继续排队（`Pending`），不超发、不错误判终态。
+2. **迁移（随 Tick 推进）——安全续跑，不是故障重跑**：每个 Tick 驱逐所有
+   `Draining` 节点上的在执行任务（`Executor.EvictOnNode` → `EvDrained` 事件）。
+   计划内驱逐与故障杀死（`EvKilled`）是**两条严格区分的链路**：
+
+   | | 计划内排空 `EvDrained` | 节点故障 `EvKilled` |
+   | --- | --- | --- |
+   | 触发 | 主动：`DrainNode` 后随 Tick 驱逐 | 被动：心跳超时判死 |
+   | 任务状态 | 复位 `Pending`，随同 tick 的 gang 调度整体迁到健康节点 | 复位 `Pending`，等后续 tick 重新放置 |
+   | **`Attempt`** | **不变**（主动迁移不是一次故障重试） | **+1** |
+   | **`Progress`** | **保留**：带已执行 tick 数迁移，在新节点上接着原来的进度跑 | **清零**：执行现场随故障丢失，从头重跑 |
+   | 作业终态 | 绝不因迁移失败；暂时放不下就继续排队 | 同样不判终态，任务重跑到成功/注入失败为止 |
+
+   `TaskRuntime.Progress` 记录任务已执行完的 tick 数：执行器每个 tick 推进后由调度器
+   按作业聚合并落盘，因此“迁到一半 / 跑到一半”的进度在驱逐和崩溃两种情况下都可续。
    已完成（`Succeeded/Failed`）任务不在执行行中，不受驱逐影响，绝不重跑、不重复统计。
 3. **`DrainStatus(nodeID)`**：返回 `DrainInfo{State, RemainingTasks, RemainingResources}`，
-   即“还剩多少任务/资源没迁完”，供运维观测排空进展。
+   即“还剩多少任务/资源没迁完”，供运维观测排空进展。注意“任务已驱逐但还在排队等
+   健康节点余量”时 `RemainingTasks` 即为 0（节点视角已空），任务在作业视角仍是
+   `Pending`，账本不超发。
 4. **`CompleteNodeDrain(nodeID)`**：节点上任务全部迁走（或本来就没任务）后正式退役：
-   状态转 `Dead`、清除排空标记并落盘、停止心跳，容量从此永久退出集群。
-   仍有任务未迁完时返回 `ErrNodeNotEmpty`，节点保持 `Draining`，迁移继续推进。
+   状态转 `Dead`，节点 ID 从排空名单移入**退役名单**并在**同一次快照写入**中落盘，
+   停止心跳，容量从此永久退出集群。仍有任务未迁完时返回 `ErrNodeNotEmpty`，
+   节点保持 `Draining`，迁移继续推进。
+5. **退役的持久性与重新上线**：
+   - **已退役节点不能靠重启后重新注册复活**：`AddNode` 发现节点 ID 在退役名单中时
+     返回 `ErrNodeRetired` 拒绝注册，节点不会出现在新节点池里，集群容量保持收缩。
+     退役/排空名单在调度器 `New` 时就从快照**预加载**（`Store.LoadMarkers`），
+     所以即使调用方在 `Recover` 之前先 `AddNode`，拦截也已经生效，不存在窗口期；
+     `Recover` 会再次把名单应用到已注册节点（先注册后恢复的顺序同样安全）。
+   - 运维确实要让该机器重新上线时，必须**显式**调用 `ReadmitNode(nodeID, capacity)`：
+     节点恢复 `Healthy`、清除退役标记并落盘、恢复心跳、容量重新计入集群（可携带新规格）。
+     对从未退役的节点/未知 ID 调用返回 `ErrNodeNotRetired`（新机器请走 `AddNode`）。
 
 **与相近机制的语义边界：**
 
-| 机制 | 触发方式 | 节点上运行中任务 | 容量何时扣除 | 节点可否回来 |
-| --- | --- | --- | --- | --- |
-| 故障回收 | 被动：心跳超时 | 判死时被杀、复位重调度 | 判死时刻 | 不会（本模拟中 Dead 即终态） |
-| 计划内排空 | 主动：`DrainNode` | 安全驱逐、迁移到健康节点继续跑 | 标记排空即退出新任务分配；退役后永久扣除 | 退役后不会；重启重新 `AddNode` 视为运维显式重新上线 |
-| 容量收缩 | 排空/故障的副作用 | — | 新提交按收缩后容量判定；已排队作业继续等待，不被误判成功/失败 | — |
-| 重启恢复 | 进程重启 + `Recover` | 执行行随进程消失，统一复位为 `Pending` 重调度 | 排空标记随快照恢复，维护中节点不会被当成健康机器 | — |
+| 机制 | 触发方式 | 节点上运行中任务 | Attempt / Progress | 容量何时扣除 | 节点可否回来 |
+| --- | --- | --- | --- | --- | --- |
+| 故障回收 | 被动：心跳超时 | 判死时被杀、复位重调度 | Attempt+1、Progress 清零从头跑 | 判死时刻 | 不会（本模拟中 Dead 即终态） |
+| 计划内排空 | 主动：`DrainNode` | 安全驱逐、迁移到健康节点继续跑 | **Attempt 不变、Progress 保留续跑** | 标记排空即退出新任务分配；退役后永久扣除 | 退役后不会被隐式复活；只有显式 `ReadmitNode` 可重新上线 |
+| 容量收缩 | 排空/故障的副作用 | — | — | 新提交按收缩后容量判定；已排队作业继续等待，不被误判成功/失败 | — |
+| 重启恢复 | 进程重启 + `Recover` | 执行行随进程消失，统一复位为 `Pending` 重调度 | Attempt+1（崩溃是非计划中断），**崩溃前已落盘的 Progress 保留续跑** | 排空/退役名单随快照恢复：维护中节点不当健康机器、已退役节点不复活 | 名单先于节点注册预加载，两种注册/恢复顺序都安全 |
 
 **边界与兼容范围：**
 
 - 排空中的节点若在维护期间真的发生故障（停止心跳），走与故障一致的
-  超时回收路径转 `Dead`，其未迁完任务按故障语义复位重调度。
+  超时回收路径转 `Dead`，其未迁完任务按**故障语义**复位重调度（Attempt+1、
+  Progress 清零）；同时清除残留排空标记（它不是退役，不进退役名单）。
 - 多台节点可同时/先后排空，各自的迁移与退役独立推进，账本始终一致。
 - 排空做到一半进程重启：`Recover` 会把持久化的排空标记重新应用到已注册节点
   （`AddNode` 在 `Recover` 之后调用时也会按标记补应用，两种顺序都安全），
-  迁到一半的任务按恢复语义复位后继续调度，不会丢失或重复统计。
-- 已退役节点不会被复活；若运维要重新上线，显式 `AddNode` 重新注册（视为新机器）。
+  迁到一半的任务按恢复语义复位（Attempt+1、Progress 保留）后继续调度，
+  不会丢失或重复统计。
+- 已退役节点不会被复活：重启后 `AddNode` 同名节点返回 `ErrNodeRetired`，
+  容量保持收缩；若运维要重新上线，显式 `ReadmitNode` 重新注册（可携带新容量），
+  该事实同样持久化，再次重启后节点是普通健康机器。
+- 故障杀死的节点（非排空退役）不在退役名单中：本模拟里它同样是 Dead 终态，
+  若要复用该机器，直接 `ReadmitNode` 即可（Dead 即“可重新上线”的统一入口）。
 
 ## 5. 进程重启恢复
 
-- 每次作业状态变更（接纳、启动、完成、失败、复位）与排空标记变更（`DrainNode`/
-  `CompleteNodeDrain`）都立即用 **临时文件 + 原子 rename** 写一张完整 JSON 快照
-  （含作业表与排空中节点列表），并将版本号 `Counter` +1。
+- 每次作业状态变更（接纳、启动、完成、失败、复位、**进度推进**）与节点标记变更
+  （`DrainNode`/`CompleteNodeDrain`/`ReadmitNode`）都立即用 **临时文件 + 原子 rename**
+  写一张完整 JSON 快照（含作业表、排空中节点列表 `Draining` 与已退役节点列表 `Retired`），
+  并将版本号 `Counter` +1。
 - 进程重启后构造新的调度器并重新注册节点（节点池与执行行从空白开始），
   调用 `Scheduler.Recover()`：
   - **已结束作业**（Succeeded/Failed）原样保留，不参与调度，重新提交时返回 `ErrDuplicateJob`，
     **不会复活**；
   - **未完成作业**继续调度；崩溃前处于 `Running` 的任务因执行行已不存在，
-    统一复位为 `Pending`、清空 NodeID、`Attempt+1`，随下一次 tick 重新 gang 放置；
+    统一复位为 `Pending`、清空 NodeID、`Attempt+1`（崩溃是非计划中断），
+    但崩溃前已随每次 Tick 落盘的 **`Progress` 予以保留**，重新放置后只补跑剩余节拍；
   - **排空中节点**按快照中的排空标记恢复为 `Draining`（不会被当成健康机器
     重新投入调度），其上未迁完的任务随复位后的 gang 调度迁往健康节点，
     之后可继续 `CompleteNodeDrain` 完成退役；
+  - **已退役节点**按退役名单保持下线：`AddNode` 同名节点被 `ErrNodeRetired` 拒绝，
+    即使节点已先注册也会在 `Recover` 时被压回 `Dead`；集群容量保持收缩，
+    只有显式 `ReadmitNode` 能让它回来；
+  - 节点标记在调度器 `New` 时就通过 `Store.LoadMarkers()` 预加载，
+    因此“先注册节点、后 Recover”与“先 Recover、后注册节点”两种顺序结果一致；
   - 新节点池账本初始为零，因此**不会重复占用**崩溃前的资源。
 - **并发安全**：所有作业状态访问都由调度器的单把 `s.mu` 串行化；
   `state.Store` 不再自持锁，保证“查重 + 写入”“恢复合并”等复合操作原子。
@@ -166,9 +204,25 @@ go test ./... -race
 # 高重复次数验证调度结果确定性 / 无偶发
 go test ./pkg/scheduler/ -count=200
 
-# 端到端演示：提交→三类拒绝→故障重调度→计划内排空下线→重启恢复
+# 并发/交错场景在竞态检测下多轮重复（排空混沌、提交竞态、恢复并发）
+go test ./pkg/scheduler/ -race -count=50 \
+  -run 'TestDrainConcurrentChaos|TestDrainConcurrentWithTicksAndSubmit|TestConcurrentTicksAndSubmit|TestRecoverConcurrentWithTicks'
+
+# 端到端演示：提交→三类拒绝→故障重调度（attempt+1/进度清零）
+#   →计划内排空续跑（attempt 不变/进度保留）→退役下线→重启不复活→显式重新上线
 go run ./cmd/gangscheduler
 ```
+
+### 本地手工复现要点
+
+1. **迁移续跑 vs 故障重跑**：提交一个长任务作业后 `Tick` 若干拍，对任务所在健康节点
+   调 `DrainNode` 再 `Tick`，观察任务的 `Progress` 连续、`Attempt` 不变、作业在原定
+   tick 数处完成；对照 `TriggerNodeFailure` 后 `Attempt+1`、`Progress` 归 0。
+2. **退役扛重启**：`CompleteNodeDrain` 后用同一 `StateFile` 新建调度器，
+   `AddNode` 同名节点应得到 `ErrNodeRetired`，健康容量总和不含该节点；
+   调 `ReadmitNode` 后容量才恢复。
+3. **排空剩余可观测**：`DrainStatus` 在驱逐前后分别返回剩余任务/资源量；
+   任务“已驱逐但排队等容量”时节点视角已空（0）、作业视角为 `Pending`。
 
 ### 测试覆盖
 
@@ -189,6 +243,12 @@ go run ./cmd/gangscheduler
 | 恢复后并发提交+调度不丢作业、不泄漏资源 | `TestRecoverConcurrentWithTicks` |
 | 存储深拷贝隔离、持久化往返 | `pkg/state` 全部测试 |
 | 排空迁移：任务安全迁到健康节点、进展可见、退役后容量收缩 | `TestDrainMigratesTasks` |
+| **排空迁移保留执行进度、Attempt 不增长；与故障 Attempt+1/清零严格区分；连续多次迁移进度累加** | `TestDrainMigrationPreservesProgressAndAttempt` `TestFailureRescheduleSemanticsUnchanged` `TestDrainThenMigrateAgainProgressKept` |
+| **退役节点重启后重新注册被拒（`ErrNodeRetired`）、不复活、容量保持收缩；标记在 Recover 前已生效** | `TestRetiredNodeNotResurrectedOnRestart` `TestRetiredMarkerEffectiveBeforeRecover` `TestDrainingMarkerEffectiveBeforeRecover` |
+| **显式 `ReadmitNode` 恢复容量并持久化；非法重新上线可区分；收缩后排队/永久放不下语义** | `TestReadmitRetiredNodeBringsCapacityBack` `TestQueuedJobStaysPendingAfterShrink` |
+| **排空与提交/调度/重启恢复的确定性交错（进度连续、账本不超发、作业不复活）与并发混沌（-race）** | `TestDrainInterleavedDeterministic` `TestDrainConcurrentChaos` |
+| **节点池退役/重新上线原语** | `pkg/cluster`：`TestPoolMarkRetiredAndReadmit` |
+| **退役名单原子迁移、进度快照往返、标记预加载** | `pkg/state`：`TestStoreRetiredAndProgressRoundTrip` `TestStoreLoadMarkersMissingFile` |
 | 空节点立即退役；收缩后提交拒绝、排队作业不误判 | `TestDrainEmptyNodeAndCapacityShrink` |
 | 排空操作的可区分错误（未知节点/重复排空/未排空就退役等） | `TestDrainErrors`、`pkg/cluster`：`TestPoolCompleteDrain` 等 |
 | 已完成任务不受排空影响 | `TestDrainCompletedTaskNotDisturbed` |

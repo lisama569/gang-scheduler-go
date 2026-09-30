@@ -180,3 +180,63 @@ func TestPoolCompleteDrainEmpty(t *testing.T) {
 		t.Fatalf("drain used on unknown node: %v", err)
 	}
 }
+
+// TestPoolMarkRetiredAndReadmit 退役标记应用与显式重新上线语义。
+func TestPoolMarkRetiredAndReadmit(t *testing.T) {
+	p := NewPool()
+	_ = p.AddNode("n1", api.Resource{CPU: 4, Memory: 4})
+	_ = p.AddNode("n2", api.Resource{CPU: 2, Memory: 2})
+
+	if err := p.MarkRetired("ghost"); err != api.ErrNodeNotFound {
+		t.Fatalf("mark retired unknown node: %v", err)
+	}
+	if err := p.MarkRetired("n2"); err != nil {
+		t.Fatalf("mark retired: %v", err)
+	}
+	if got := p.Snapshot()[1].State; got != api.NodeDead {
+		t.Fatalf("n2 state=%s want Dead", got)
+	}
+	// 退役节点不参与放置：Plan 只看得见 n1。
+	plan := p.Plan(
+		map[string]api.Resource{"a": {CPU: 4, Memory: 4}, "b": {CPU: 1, Memory: 1}},
+		[]string{"a", "b"},
+	)
+	if plan != nil {
+		t.Fatalf("retired n2 must be excluded from placement: %+v", plan)
+	}
+
+	// 健康节点不能被 readmit（避免误重建在服机器），未注册节点则直接登记。
+	if err := p.ReadmitNode("n1", api.Resource{CPU: 4, Memory: 4}); err != api.ErrNodeNotRetired {
+		t.Fatalf("readmit healthy node: %v", err)
+	}
+	if err := p.ReadmitNode("n2", api.Resource{CPU: 3, Memory: 3}); err != nil {
+		t.Fatalf("readmit retired n2: %v", err)
+	}
+	if got := p.Snapshot()[1]; got.State != api.NodeHealthy || got.Capacity.CPU != 3 {
+		t.Fatalf("n2 should be healthy with new capacity: %+v", got)
+	}
+	if err := p.ReadmitNode("n3", api.Resource{CPU: 1, Memory: 1}); err != nil {
+		t.Fatalf("readmit unseen node should register it: %v", err)
+	}
+	if n, ok := p.Node("n3"); !ok || n.Snapshot().State != api.NodeHealthy {
+		t.Fatalf("n3 should be registered healthy: ok=%v", ok)
+	}
+	// 重新上线后重新参与放置：a(4cpu) 占住 n1 后，b(3cpu) 必须能放到 n2。
+	plan = p.Plan(
+		map[string]api.Resource{
+			"a": {CPU: 4, Memory: 4},
+			"b": {CPU: 3, Memory: 3},
+		},
+		[]string{"a", "b"},
+	)
+	if len(plan) != 2 {
+		t.Fatalf("gang plan needs both n1 and readmitted n2: %+v", plan)
+	}
+	gotNode := map[string]string{}
+	for _, pl := range plan {
+		gotNode[pl.TaskName] = pl.NodeID
+	}
+	if gotNode["a"] != "n1" || gotNode["b"] != "n2" {
+		t.Fatalf("b must land on readmitted n2: %+v", gotNode)
+	}
+}

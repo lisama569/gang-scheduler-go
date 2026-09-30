@@ -137,9 +137,9 @@ func TestRecoverPersistRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustSubmit(t, s1, api.JobSpec{ID: "j", Tasks: []api.TaskSpec{
-		{Name: "t", Duration: 2, Resources: api.Resource{CPU: 2, Memory: 1}},
+		{Name: "t", Duration: 3, Resources: api.Resource{CPU: 2, Memory: 1}},
 	}})
-	s1.Tick() // 已启动尚未完成 -> 进程在此“崩溃”
+	s1.Tick() // 已启动并跑完一拍（progress=1），尚未完成 -> 进程在此“崩溃”
 
 	s2 := New(Config{StateFile: path, Logger: testLogger(t)})
 	if err := s2.AddNode("n1", api.Resource{CPU: 4, Memory: 8}); err != nil {
@@ -148,22 +148,33 @@ func TestRecoverPersistRoundTrip(t *testing.T) {
 	if _, err := s2.Recover(); err != nil {
 		t.Fatal(err)
 	}
-	before := s2.store.Counter()
-	s2.Tick() // 恢复后重新放置并启动
+	// 崩溃前的执行进度随快照保留：恢复后任务从 progress=1 续跑而不是重头再来。
 	j, _ := s2.GetJob("j")
+	if j.Tasks[0].Progress != 1 || j.Tasks[0].State != api.TaskPending {
+		t.Fatalf("recovered task must keep progress=1 and be pending: %+v", j.Tasks[0])
+	}
+	before := s2.store.Counter()
+	s2.Tick() // 恢复后重新放置并启动，tick 末再跑一拍（progress=2，仍 Running）
+	j, _ = s2.GetJob("j")
 	if j.State != api.JobRunning {
 		t.Fatalf("recovered task should relaunch, got state=%s", j.State)
 	}
-	s2.Tick() // 执行到完成
+	if j.Tasks[0].Progress != 2 {
+		t.Fatalf("relaunched task must continue from saved progress: %+v", j.Tasks[0])
+	}
+	s2.Tick() // 执行完剩余一拍即完成
 	after := s2.store.Counter()
 	j, _ = s2.GetJob("j")
 	if j.State != api.JobSucceeded {
 		t.Fatalf("job should finish on recovered scheduler, got %s", j.State)
 	}
+	if j.Tasks[0].Progress != 3 {
+		t.Fatalf("recovered task must reach full progress 3, got %d", j.Tasks[0].Progress)
+	}
 	if after <= before {
 		t.Fatalf("snapshot version must increase after writes: before=%d after=%d", before, after)
 	}
-	t.Logf("snapshot version advanced %d -> %d across restart", before, after)
+	t.Logf("snapshot version advanced %d -> %d across restart, progress resumed 1 -> 3", before, after)
 }
 
 // TestRecoverConcurrentWithTicks 恢复与外部并发 Tick/Submit 同时发生时，

@@ -22,6 +22,12 @@ var (
 	ErrNodeNotDraining = errors.New("node is not draining")
 	// ErrNodeNotEmpty 节点上仍有未迁走的任务，不能退役。
 	ErrNodeNotEmpty = errors.New("node still has running tasks")
+	// ErrNodeRetired 节点此前已完成排空并永久退役。重启后直接 AddNode
+	// 重新注册同名节点会得到此错误：已下线节点不能靠重新注册复活，
+	// 必须由运维显式调用 ReadmitNode 才能重新上线。
+	ErrNodeRetired = errors.New("node is retired")
+	// ErrNodeNotRetired ReadmitNode 的目标节点并不在已退役名单中。
+	ErrNodeNotRetired = errors.New("node is not retired")
 )
 
 // RejectError 包装拒绝原因，便于调用方 errors.Is 判断并打印明细。
