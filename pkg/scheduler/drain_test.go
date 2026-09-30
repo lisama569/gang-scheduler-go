@@ -73,13 +73,19 @@ func TestDrainMigratesTasks(t *testing.T) {
 		t.Fatalf("complete while task remains: %v", err)
 	}
 
-	s.Tick() // 2: t2 被安全驱逐 -> Pending -> 同 tick 迁到 n3
+	s.Tick() // 2: t2 被安全驱逐 -> Pending -> 同 tick 迁到 n3，带着原进度继续
 	j, _ = s.GetJob("job")
 	if j.Tasks[1].State != api.TaskRunning || j.Tasks[1].NodeID != "n3" {
 		t.Fatalf("t2 must migrate to healthy n3, got %+v", j.Tasks[1])
 	}
-	if j.Tasks[1].Attempt != 1 {
-		t.Fatalf("t2 attempt should be 1 after migration, got %d", j.Tasks[1].Attempt)
+	// 计划内迁移不是故障：Attempt 不增加。
+	if j.Tasks[1].Attempt != 0 {
+		t.Fatalf("planned migration must not increment attempt, got %d", j.Tasks[1].Attempt)
+	}
+	// t2 已在 n2 上跑完 tick1（剩余 5 拍）：进度随迁移保留，
+	// executor 按剩余节拍继续而不是从头跑。
+	if j.Tasks[1].Progress != 1 {
+		t.Fatalf("t2 progress must be carried over (1 done tick), got %d", j.Tasks[1].Progress)
 	}
 	if j.Tasks[0].State != api.TaskRunning || j.Tasks[0].NodeID != "n1" {
 		t.Fatalf("t1 must be undisturbed on n1: %+v", j.Tasks[0])
@@ -105,15 +111,17 @@ func TestDrainMigratesTasks(t *testing.T) {
 		t.Fatalf("job exceeding shrunken capacity must be rejected, got %v", err)
 	}
 
-	for i := 0; i < 8; i++ {
+	// 迁移在 tick2 完成，t2 在 n3 上只需把剩余 4 拍跑完：
+	// 若错误地从头重跑（旧行为），要到 tick7 才完成；保留进度则 tick6 即完成。
+	for i := 0; i < 4; i++ { // tick 3..6
 		s.Tick()
 	}
 	j, _ = s.GetJob("job")
 	if j.State != api.JobSucceeded {
-		t.Fatalf("job must succeed after migration: %s (%+v)", j.State, j.Tasks)
+		t.Fatalf("job must succeed at tick6 with carried-over progress: %s (%+v)", j.State, j.Tasks)
 	}
-	// t2 只在 n3 上完整执行了一次（attempt=1），没有被重复统计。
-	if j.Tasks[1].NodeID != "n3" || j.Tasks[1].Attempt != 1 {
+	// t2 全程只启动了一次执行（attempt=0），迁移没有被记成一次重试。
+	if j.Tasks[1].NodeID != "n3" || j.Tasks[1].Attempt != 0 || j.Tasks[1].Progress != 1 {
 		t.Fatalf("t2 final: %+v", j.Tasks[1])
 	}
 	if n := nodeState(t, s, "n2"); n.Used != (api.Resource{}) {

@@ -114,3 +114,63 @@ func TestInjectFailure(t *testing.T) {
 		t.Fatal("second injection after finish must be rejected (idempotent)")
 	}
 }
+
+// TestEvictOnNodeCarriesProgress 计划内排空驱逐必须携带剩余节拍，
+// 任务用该剩余节拍重新 Launch 后接着原进度跑完，且不丢资源账。
+func TestEvictOnNodeCarriesProgress(t *testing.T) {
+	e, pool, events := newExec(t)
+	if !pool.TryCommit([]cluster.Placement{{
+		TaskName: "a", NodeID: "n1", Request: api.Resource{CPU: 2, Memory: 1},
+	}}) {
+		t.Fatal("commit")
+	}
+	tr := rt("a", 5, 2) // duration=5
+	if !e.Launch("j", tr) {
+		t.Fatal("launch")
+	}
+	e.Tick() // 跑 1 拍，剩 4
+	e.Tick() // 跑 1 拍，剩 3
+
+	e.EvictOnNode("n1") // 计划内驱逐（不是 Kill）
+	var ev Event
+	for ev = range events {
+		break
+	}
+	if ev.Kind != EvDrained {
+		t.Fatalf("want EvDrained, got %+v", ev)
+	}
+	if ev.Remaining != 3 {
+		t.Fatalf("eviction must carry remaining=3 ticks, got %d", ev.Remaining)
+	}
+	if n, _ := pool.Node("n1"); n.Snapshot().Used != (api.Resource{}) {
+		t.Fatalf("eviction must release ledger: %+v", n.Snapshot().Used)
+	}
+	if e.Inflight() != 0 {
+		t.Fatal("evicted task must leave inflight set")
+	}
+
+	// 模拟迁移：节点资源在健康节点重新提交，任务按剩余 3 拍继续。
+	if !pool.TryCommit([]cluster.Placement{{
+		TaskName: "a", NodeID: "n1", Request: api.Resource{CPU: 2, Memory: 1},
+	}}) {
+		t.Fatal("re-commit")
+	}
+	migrated := tr
+	migrated.Progress = 5 - ev.Remaining // Progress=2
+	if !e.Launch("j", migrated) {
+		t.Fatal("re-launch after migration")
+	}
+	e.Tick() // 剩 2
+	e.Tick() // 剩 1
+	if e.Inflight() != 1 {
+		t.Fatal("migrated task should still be running")
+	}
+	e.Tick() // 剩 0 -> 完成：只需 3 拍而非完整 5 拍
+	var fin Event
+	for fin = range events {
+		break
+	}
+	if fin.Kind != EvFinished || !fin.OK {
+		t.Fatalf("migrated task must finish using carried progress: %+v", fin)
+	}
+}

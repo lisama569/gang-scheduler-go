@@ -138,6 +138,19 @@ func (p *Pool) DrainUsed(id string) (api.Resource, error) {
 	return n.Snapshot().Used, nil
 }
 
+// MarkRetired 把已注册节点按持久化的退役记录置为 Dead：
+// 重启后以同一 ID 重新注册的已退役节点不允许复活，容量保持扣除。
+func (p *Pool) MarkRetired(id string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n, ok := p.nodes[id]
+	if !ok {
+		return api.ErrNodeNotFound
+	}
+	n.MarkRetired()
+	return nil
+}
+
 // sortedHealthyIDs 返回健康节点 ID 的确定性排序（注册顺序即确定，这里再防御性排序）。
 func (p *Pool) sortedHealthyIDsLocked() []string {
 	ids := make([]string, 0, len(p.order))

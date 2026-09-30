@@ -101,3 +101,49 @@ func TestStoreUpdateMissing(t *testing.T) {
 		t.Fatalf("missing update must return ErrJobNotFound, got %v", err)
 	}
 }
+
+// TestStoreRetiredAndProgressRoundTrip 退役记录与任务进度必须随快照落盘并恢复。
+func TestStoreRetiredAndProgressRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	s1 := New(path)
+	j := sampleJob("j", api.JobRunning)
+	j.Tasks[0].Progress = 3
+	if err := s1.Add(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.SetDraining("nd", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.RetireNodeMarker("nr"); err != nil {
+		t.Fatal(err)
+	}
+	if !s1.IsRetired("nr") || s1.IsDraining("nr") {
+		t.Fatal("retire must mark retired and clear any draining marker")
+	}
+	if len(s1.Retired()) != 1 || s1.Retired()[0] != "nr" {
+		t.Fatalf("retired list wrong: %v", s1.Retired())
+	}
+
+	s2 := New(path)
+	if _, _, err := s2.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if !s2.IsRetired("nr") {
+		t.Fatal("retired node must survive snapshot recovery")
+	}
+	if !s2.IsDraining("nd") {
+		t.Fatal("draining node must survive snapshot recovery")
+	}
+	got, _ := s2.Get("j")
+	if got.Tasks[0].Progress != 3 {
+		t.Fatalf("task progress must survive snapshot, got %d", got.Tasks[0].Progress)
+	}
+
+	// 排空中节点真故障后清除标记，不影响退役集合。
+	if err := s2.ClearDraining("nd"); err != nil {
+		t.Fatal(err)
+	}
+	if s2.IsDraining("nd") || !s2.IsRetired("nr") {
+		t.Fatal("clear-draining must not touch retired set")
+	}
+}

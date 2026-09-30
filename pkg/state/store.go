@@ -23,10 +23,18 @@ type Store struct {
 	// draining 记录处于维护/排空中的节点 ID，随快照一起落盘，
 	// 保证重启恢复后排空中的节点不会被当成健康机器重新投入调度。
 	draining map[string]bool
+	// retired 记录已通过计划内退役正式下线的节点 ID，随快照一起落盘，
+	// 保证重启后同名节点重新注册时保持 Dead，已收缩的容量不涨回。
+	retired map[string]bool
 }
 
 func New(path string) *Store {
-	return &Store{path: path, jobs: map[string]*api.JobRuntime{}, draining: map[string]bool{}}
+	return &Store{
+		path:     path,
+		jobs:     map[string]*api.JobRuntime{},
+		draining: map[string]bool{},
+		retired:  map[string]bool{},
+	}
 }
 
 func cloneTask(t api.TaskRuntime) api.TaskRuntime {
@@ -36,9 +44,10 @@ func cloneTask(t api.TaskRuntime) api.TaskRuntime {
 			Resources: t.Spec.Resources,
 			Duration:  t.Spec.Duration,
 		},
-		State:   t.State,
-		NodeID:  t.NodeID,
-		Attempt: t.Attempt,
+		State:    t.State,
+		NodeID:   t.NodeID,
+		Attempt:  t.Attempt,
+		Progress: t.Progress,
 	}
 }
 
@@ -121,8 +130,39 @@ func (s *Store) IsDraining(nodeID string) bool { return s.draining[nodeID] }
 
 // Draining 返回全部排空中节点 ID 的确定性排序列表。
 func (s *Store) Draining() []string {
-	out := make([]string, 0, len(s.draining))
-	for id := range s.draining {
+	return sortedKeys(s.draining)
+}
+
+// RetireNodeMarker 在节点完成排空正式退役时原子地清除其排空标记、
+// 记入退役集合，并立即落盘（一次快照变更，避免中间态）。
+// 调用方必须持有上层串行化锁。
+func (s *Store) RetireNodeMarker(nodeID string) error {
+	delete(s.draining, nodeID)
+	s.retired[nodeID] = true
+	return s.Persist()
+}
+
+// ClearDraining 清除一个节点的排空标记（例如排空中节点真故障被判死），
+// 不改变其退役记录。调用方必须持有上层串行化锁。
+func (s *Store) ClearDraining(nodeID string) error {
+	if !s.draining[nodeID] {
+		return nil
+	}
+	delete(s.draining, nodeID)
+	return s.Persist()
+}
+
+// IsRetired 查询节点是否已正式退役下线。
+func (s *Store) IsRetired(nodeID string) bool { return s.retired[nodeID] }
+
+// Retired 返回全部已退役节点 ID 的确定性排序列表。
+func (s *Store) Retired() []string {
+	return sortedKeys(s.retired)
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for id := range m {
 		out = append(out, id)
 	}
 	sortStrings(out)
@@ -135,7 +175,7 @@ func (s *Store) Persist() error {
 		s.counter++
 		return nil
 	}
-	snap := api.Snapshot{Counter: s.counter + 1, Draining: s.Draining()}
+	snap := api.Snapshot{Counter: s.counter + 1, Draining: s.Draining(), Retired: s.Retired()}
 	ids := make([]string, 0, len(s.jobs))
 	for id := range s.jobs {
 		ids = append(ids, id)
@@ -150,7 +190,13 @@ func (s *Store) Persist() error {
 			Tasks:  make([]api.TaskRecord, len(j.Tasks)),
 		}
 		for i, t := range j.Tasks {
-			rec.Tasks[i] = api.TaskRecord{Spec: t.Spec, State: t.State, NodeID: t.NodeID, Attempt: t.Attempt}
+			rec.Tasks[i] = api.TaskRecord{
+				Spec:     t.Spec,
+				State:    t.State,
+				NodeID:   t.NodeID,
+				Attempt:  t.Attempt,
+				Progress: t.Progress,
+			}
 		}
 		snap.Jobs = append(snap.Jobs, rec)
 	}
@@ -206,7 +252,13 @@ func (s *Store) Recover() (int, []*api.JobRuntime, error) {
 			Tasks:  make([]api.TaskRuntime, len(rec.Tasks)),
 		}
 		for i, tr := range rec.Tasks {
-			j.Tasks[i] = api.TaskRuntime{Spec: tr.Spec, State: tr.State, NodeID: tr.NodeID, Attempt: tr.Attempt}
+			j.Tasks[i] = api.TaskRuntime{
+				Spec:     tr.Spec,
+				State:    tr.State,
+				NodeID:   tr.NodeID,
+				Attempt:  tr.Attempt,
+				Progress: tr.Progress,
+			}
 		}
 		s.jobs[rec.Spec.ID] = j
 		added = append(added, cloneJob(j))
@@ -218,6 +270,10 @@ func (s *Store) Recover() (int, []*api.JobRuntime, error) {
 	// 内存中已有的标记（恢复与并发排空交错时更新）也不被旧快照回退。
 	for _, id := range snap.Draining {
 		s.draining[id] = true
+	}
+	// 退役记录同样按并集合并：已正式下线的节点在任何交错顺序下都不复活。
+	for _, id := range snap.Retired {
+		s.retired[id] = true
 	}
 	return snap.Counter, added, nil
 }

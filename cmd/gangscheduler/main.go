@@ -93,7 +93,7 @@ func main() {
 	fmt.Printf("submit after capacity shrink rejected as: %v\n", err)
 
 	for i := 0; i < 10; i++ {
-		s1.Tick() // w1 完成后 w2 在 node-a 上继续，job-web 最终成功
+		s1.Tick() // w1 完成后 w2 在 node-a 上带着进度继续，job-web 最终成功
 	}
 	printJob(s1, "job-web")
 
@@ -143,7 +143,8 @@ func printJob(s *scheduler.Scheduler, id string) {
 	}
 	fmt.Printf("job %s state=%s reason=%q\n", id, j.State, j.Reason)
 	for _, t := range j.Tasks {
-		fmt.Printf("  task %s state=%s node=%s attempt=%d\n", t.Spec.Name, t.State, t.NodeID, t.Attempt)
+		fmt.Printf("  task %s state=%s node=%s attempt=%d progress=%d/%d\n",
+			t.Spec.Name, t.State, t.NodeID, t.Attempt, t.Progress, t.Spec.Duration)
 	}
 }
 

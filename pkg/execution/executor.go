@@ -24,6 +24,9 @@ type Event struct {
 	NodeID   string
 	Request  api.Resource
 	OK       bool
+	// Remaining 仅 EvDrained（计划内排空安全驱逐）携带：任务被驱逐时
+	// 尚未执行完的节拍数，供调度器在任务迁移到新节点后接着原进度继续跑。
+	Remaining int
 }
 
 // Executor 在模拟节点上驱动任务执行：按 tick 推进剩余节拍，
@@ -54,6 +57,9 @@ func New(pool *cluster.Pool, events chan<- Event) *Executor {
 }
 
 // Launch 登记一个开始执行的任务。重复登记同一任务会被拒绝（防御重复执行）。
+// 任务从 t.Progress 个已完成节拍处继续：启动后只需执行
+// Spec.Duration-Progress 拍（新启动/故障重跑/重启恢复时 Progress=0，即从头跑；
+// 排空迁移时 Progress 保留迁移前的执行进度）。
 func (e *Executor) Launch(jobID string, t api.TaskRuntime) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -61,12 +67,16 @@ func (e *Executor) Launch(jobID string, t api.TaskRuntime) bool {
 	if _, ok := e.running[key]; ok {
 		return false
 	}
+	remaining := t.Spec.Duration - t.Progress
+	if remaining < 1 {
+		remaining = 1
+	}
 	e.running[key] = &inflight{
 		jobID:     jobID,
 		taskName:  t.Spec.Name,
 		nodeID:    t.NodeID,
 		request:   t.Spec.Resources,
-		remaining: t.Spec.Duration,
+		remaining: remaining,
 	}
 	return true
 }
@@ -114,11 +124,12 @@ func (e *Executor) EvictOnNode(nodeID string) {
 	for _, inf := range evicted {
 		e.pool.Release(nodeID, inf.request)
 		e.events <- Event{
-			Kind:     EvDrained,
-			JobID:    inf.jobID,
-			TaskName: inf.taskName,
-			NodeID:   nodeID,
-			Request:  inf.request,
+			Kind:      EvDrained,
+			JobID:     inf.jobID,
+			TaskName:  inf.taskName,
+			NodeID:    nodeID,
+			Request:   inf.request,
+			Remaining: inf.remaining,
 		}
 	}
 }

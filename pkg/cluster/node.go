@@ -36,6 +36,13 @@ func (n *Node) MarkDead() {
 	n.rt.Used = api.Resource{}
 }
 
+// MarkRetired 把节点按“已正式退役”语义直接置为 Dead（重启恢复后重新注册
+// 同名节点时使用）：它从来没有参与本次进程的调度，账本本就应为零。
+func (n *Node) MarkRetired() {
+	n.rt.State = api.NodeDead
+	n.rt.Used = api.Resource{}
+}
+
 // BeginDrain 将健康节点置为排空中：从这一刻起不再接收新任务，
 // 但心跳照常刷新（它是计划内维护，不是故障），存量任务由调度器迁移。
 func (n *Node) BeginDrain() bool {

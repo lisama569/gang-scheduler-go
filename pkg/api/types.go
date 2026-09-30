@@ -57,6 +57,10 @@ type TaskRuntime struct {
 	State   string
 	NodeID  string // 运行所在节点；Pending 时为空
 	Attempt int
+	// Progress 是任务在“当前这次启动之前”已经执行完成的 tick 数。
+	// 仅计划内维护/排空的安全迁移会保留它（迁到新节点后接着剩余节拍跑）；
+	// 节点故障回收与进程重启恢复按各自语义从头重跑，Progress 清零。
+	Progress int
 }
 
 // NodeRuntime 是模拟节点的运行时视图。
@@ -78,10 +82,11 @@ type DrainInfo struct {
 
 // jobRecord / taskRecord 是持久化到状态存储的快照记录。
 type TaskRecord struct {
-	Spec    TaskSpec
-	State   string
-	NodeID  string
-	Attempt int
+	Spec     TaskSpec
+	State    string
+	NodeID   string
+	Attempt  int
+	Progress int
 }
 
 type JobRecord struct {
@@ -98,4 +103,7 @@ type Snapshot struct {
 	// Draining 记录处于维护/排空中的节点 ID，保证重启恢复后
 	// 这些节点不会被当成正常机器重新投入调度。
 	Draining []string
+	// Retired 记录已通过计划内退役正式下线（容量永久扣除）的节点 ID，
+	// 保证重启后即使以相同 ID 重新注册，该节点也保持 Dead、容量不涨回。
+	Retired []string
 }
